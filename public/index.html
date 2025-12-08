@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Choix du nom de domaine</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="container">
+      <section class="card hero-card">
+        <p class="hero-kicker">Merci pour votre commande !</p>
+        <h1 class="hero-title">Nous lançons la création de votre adresse email professionnelle</h1>
+        <p class="hero-body">
+          Il ne reste qu'un court formulaire à compléter afin que nous finalisions la configuration au plus vite.
+        </p>
+      </section>
+
+      <form id="domain-form" class="form-grid">
+        <section class="card">
+          <h2>Informations de base</h2>
+          <div class="form-stack">
+            <label for="fullName">Prénom et nom</label>
+            <input id="fullName" name="fullName" type="text" required />
+            <p class="field-error" id="fullName-error"></p>
+          </div>
+          <div class="form-stack">
+            <label for="company">Nom de l'entreprise</label>
+            <input id="company" name="company" type="text" required />
+            <p class="field-error" id="company-error"></p>
+          </div>
+          <div class="form-stack">
+            <label for="currentEmail">Adresse email actuelle</label>
+            <input id="currentEmail" name="currentEmail" type="email" required />
+            <small>Cette adresse sera utilisée pour vous envoyer vos accès.</small>
+            <p class="field-error" id="currentEmail-error"></p>
+          </div>
+          <fieldset class="form-stack">
+            <legend class="sr-only">
+              Disposez-vous déjà d'un nom de domaine ou d'une adresse email professionnelle active pour votre
+              entreprise ?
+            </legend>
+            <div class="fieldset-title">
+              Disposez-vous déjà d'un nom de domaine ou d'une adresse email professionnelle active pour votre
+              entreprise ?
+            </div>
+            <label>
+              <input type="radio" name="hasExistingDomain" value="no" required />
+              Non, aucun domaine / email pro n'existe aujourd'hui
+            </label>
+            <label>
+              <input type="radio" name="hasExistingDomain" value="yes" required />
+              Oui, un domaine ou une adresse existe déjà
+            </label>
+          </fieldset>
+          <p id="existingDomainInfo" style="display: none;">
+            Comme indiqué avant l'achat, cette offre n'inclut pas la reprise, la modification ou la migration de
+            domaines ou d'adresses existants. Un <strong>nouveau</strong> nom de domaine et une
+            <strong>nouvelle</strong> adresse email professionnelle seront créées pour votre entreprise, indépendamment
+            de vos services actuels.
+          </p>
+          <div class="honeypot">
+            <label for="hp-field">Laissez ce champ vide</label>
+            <input type="text" id="hp-field" name="hp-field" autocomplete="off" tabindex="-1" />
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Nom affiché</h2>
+          <p class="helper">Ce nom apparaîtra comme expéditeur lorsque vous enverrez des mails.</p>
+          <div class="form-stack">
+            <input
+              id="displayName"
+              name="displayName"
+              type="text"
+              required
+              aria-label="Nom affiché sur vos emails"
+              placeholder="Nom affiché sur vos emails"
+            />
+            <small>Exemples : Jean Dupont, Cabinet Martin, Atelier Lefèvre...</small>
+            <p class="field-error" id="displayName-error"></p>
+          </div>
+        </section>
+
+        <section class="card">
+          <h1>Choisissez le début de votre adresse mail professionnelle</h1>
+          <div class="form-stack">
+            <label for="local-part" class="label">Début de l'adresse :</label>
+            <input
+              type="text"
+              id="local-part"
+              name="localPart"
+              placeholder="ex : contact"
+              autocomplete="off"
+              required
+            />
+            <p class="micro-help">
+              Écrivez simplement le mot qui apparaîtra avant le @ (exemples : contact, info, accueil, votre prénom).
+            </p>
+            <p class="local-error" id="local-error"></p>
+            <p class="preview" id="email-preview">Adresse finale : contact@votre-domaine.fr</p>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Choisissez votre nom de domaine</h2>
+          <p class="subtitle">
+            Tapez un nom de domaine pour vérifier sa disponibilité puis sélectionnez celui qui vous convient.
+          </p>
+          <div class="form">
+            <input
+              type="text"
+              id="domain-input"
+              name="requestedDomain"
+              placeholder="ex : boulangeriedupont.fr"
+              autocomplete="off"
+              required
+            />
+            <button type="button" id="check-button">Vérifier</button>
+          </div>
+          <p id="domain-unavailable" class="field-error" style="display: none;"></p>
+          <input type="hidden" id="chosenDomain" name="chosenDomain" />
+          <input type="hidden" id="sessionId" name="sessionId" />
+          <div id="status-area" class="status"></div>
+        </section>
+
+        <section id="results" class="card hidden">
+          <h2>Résultats</h2>
+          <div id="result-message"></div>
+          <div id="alternatives" class="alternatives"></div>
+        </section>
+
+        <section id="confirmation" class="card hidden">
+          <h2>Votre adresse email professionnelle</h2>
+          <p id="selection-preview" class="preview"></p>
+          <p class="field-error" id="selection-error"></p>
+          <p class="warning-text">
+            Une fois cette adresse validée, la configuration sera lancée et elle ne pourra plus être modifiée. Toute
+            nouvelle adresse nécessitera une nouvelle commande (29 €).
+          </p>
+          <div class="confirm-actions">
+            <button type="button" id="confirm-selection">Valider cette adresse</button>
+          </div>
+        </section>
+      </form>
+    </main>
+    <script src="./main.js"></script>
+  </body>
+</html>

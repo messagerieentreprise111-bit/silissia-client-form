@@ -1,0 +1,66 @@
+{
+  "email:juliendurant015@gmail.com": {
+    "completed": true,
+    "completedAt": "2025-11-25T19:09:02.755Z"
+  },
+  "session:manual-check-1": {
+    "completed": true,
+    "completedAt": "2025-11-25T19:11:05.712Z"
+  },
+  "email:agencevoxety@gmail.com": {
+    "completed": true,
+    "completedAt": "2025-11-25T19:16:51.724Z"
+  },
+  "email:messagerie.entreprise111@gmail.com": {
+    "completed": true,
+    "completedAt": "2025-11-25T19:19:25.839Z"
+  },
+  "session:cli-check-2": {
+    "completed": true,
+    "completedAt": "2025-11-25T19:20:24.489Z"
+  },
+  "session:cli-check-new": {
+    "completed": true,
+    "completedAt": "2025-11-25T19:24:46.422Z"
+  },
+  "session:cli-check-log": {
+    "completed": true,
+    "completedAt": "2025-11-25T19:25:54.263Z"
+  },
+  "session:cli-check-sheet5": {
+    "completed": true,
+    "completedAt": "2025-11-25T19:45:14.674Z"
+  },
+  "session:cli-direct-1": {
+    "completed": true,
+    "completedAt": "2025-11-25T19:54:36.366Z"
+  },
+  "session:cli-log-check": {
+    "completed": true,
+    "completedAt": "2025-11-25T20:00:30.681Z"
+  },
+  "session:cli-relay-1": {
+    "completed": true,
+    "completedAt": "2025-11-25T20:04:39.580Z"
+  },
+  "session:cli-final-1": {
+    "completed": true,
+    "completedAt": "2025-11-25T20:51:31.939Z"
+  },
+  "session:cli-final-2": {
+    "completed": true,
+    "completedAt": "2025-11-25T20:52:27.461Z"
+  },
+  "email:test@testons.com": {
+    "completed": true,
+    "completedAt": "2025-11-25T20:53:46.817Z"
+  },
+  "email:nerdynerdy923@gmail.com": {
+    "completed": true,
+    "completedAt": "2025-11-25T21:03:04.791Z"
+  },
+  "email:voxetoagency@gmail.com": {
+    "completed": true,
+    "completedAt": "2025-11-25T22:00:03.330Z"
+  }
+}

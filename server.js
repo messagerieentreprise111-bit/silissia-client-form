@@ -1,0 +1,372 @@
+require('dotenv').config();
+const express = require('express');
+const path = require('path');
+const fs = require('fs/promises');
+const nodemailer = require('nodemailer');
+const rateLimit = require('express-rate-limit');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const FASTLY_API_TOKEN = process.env.FASTLY_API_TOKEN;
+const SELECTIONS_PATH = path.join(__dirname, 'data', 'selections.json');
+const COMPLETIONS_PATH = path.join(__dirname, 'data', 'completions.json');
+const SMTP_HOST = process.env.SMTP_HOST;
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
+const SMTP_TO = process.env.NOTIFY_TO || 'contact@silissia.com';
+const DISABLE_COMPLETION_GUARD = process.env.DISABLE_COMPLETION_GUARD === 'true';
+const APPS_SCRIPT_WEBHOOK = process.env.APPS_SCRIPT_WEBHOOK || '';
+
+if (!FASTLY_API_TOKEN) {
+  console.error('Missing FASTLY_API_TOKEN in .env');
+  process.exit(1);
+}
+
+app.use(
+  express.json({
+    limit: '10kb',
+    verify: (req, res, buf) => {
+      req.rawBodyLength = buf.length;
+    },
+  })
+);
+app.use(express.static(path.join(__dirname, 'public')));
+
+const availabilityKeys = ['available', 'inactive', 'undelegated'];
+const domainRegex = /^[a-z0-9-]+\.[a-z]{2,24}$/;
+const emailRegex =
+  /^[\w.!#$%&'*+/=?^`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
+
+const mailer =
+  SMTP_HOST && SMTP_USER && SMTP_PASS
+    ? nodemailer.createTransport({
+        host: SMTP_HOST,
+        port: SMTP_PORT,
+        secure: SMTP_PORT === 465,
+        auth: { user: SMTP_USER, pass: SMTP_PASS },
+      })
+    : null;
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop de requetes. Merci de reessayer dans une minute.' },
+});
+app.use('/api/', apiLimiter);
+
+function normalizeDomain(raw) {
+  if (!raw) return null;
+  const cleaned = raw.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '');
+  if (!domainRegex.test(cleaned)) {
+    return null;
+  }
+  return cleaned;
+}
+
+function generateVariants(domain) {
+  const [label, ...rest] = domain.split('.');
+  const tld = rest.join('.') || 'com';
+  const altTlds = [tld, 'com', 'fr', 'net', 'org', 'io', 'co'];
+  const variants = new Set();
+
+  const labelNoHyphen = label.replace(/-/g, '');
+  const labelWithHyphen =
+    label.includes('-') || label.length < 8
+      ? label
+      : `${label.slice(0, Math.ceil(label.length / 2))}-${label.slice(Math.ceil(label.length / 2))}`;
+
+  for (const alt of altTlds) {
+    const tldCandidate = alt.startsWith('.') ? alt.slice(1) : alt;
+    variants.add(`${label}.${tldCandidate}`);
+    variants.add(`${labelNoHyphen}.${tldCandidate}`);
+    variants.add(`${labelWithHyphen}.${tldCandidate}`);
+  }
+
+  variants.delete(domain);
+  return Array.from(variants).slice(0, 12);
+}
+
+async function checkAvailability(domain) {
+  const response = await fetch(
+    `https://api.domainr.com/v2/status?domain=${encodeURIComponent(domain)}`,
+    {
+      headers: {
+        'Fastly-Key': FASTLY_API_TOKEN,
+        Accept: 'application/json',
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Domain check failed with status ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const entry = payload?.status?.[0];
+  if (!entry) {
+    return { available: false, status: 'unknown' };
+  }
+
+  const statusText = (entry.status || '').toLowerCase();
+  const summaryText = (entry.summary || '').toLowerCase();
+
+  const available = availabilityKeys.some(
+    (key) => statusText.includes(key) || summaryText.includes(key)
+  );
+
+  return {
+    available,
+    status: entry.status,
+    summary: entry.summary,
+  };
+}
+
+async function ensureSelectionsFile() {
+  await fs.mkdir(path.dirname(SELECTIONS_PATH), { recursive: true });
+  try {
+    await fs.access(SELECTIONS_PATH);
+  } catch {
+    await fs.writeFile(SELECTIONS_PATH, '[]', 'utf8');
+  }
+}
+
+async function ensureCompletionsFile() {
+  await fs.mkdir(path.dirname(COMPLETIONS_PATH), { recursive: true });
+  try {
+    await fs.access(COMPLETIONS_PATH);
+  } catch {
+    await fs.writeFile(COMPLETIONS_PATH, '{}', 'utf8');
+  }
+}
+
+async function sendNotification({ domain, localPart, clientEmail }) {
+  if (!mailer) {
+    console.warn('SMTP settings missing, skipping email notification.');
+    return;
+  }
+
+  const subject = `Nouveau choix de domaine : ${domain}`;
+  const text = [
+    'Un client a confirme un domaine.',
+    `Domaine : ${domain}`,
+    `Debut d'adresse : ${localPart || '(non renseigne)'}`,
+    `Email client : ${clientEmail || '(non renseigne)'}`,
+  ].join('\n');
+
+  await mailer.sendMail({
+    from: SMTP_FROM,
+    to: SMTP_TO,
+    subject,
+    text,
+  });
+}
+
+async function forwardToWebhook(payload) {
+  if (!APPS_SCRIPT_WEBHOOK) return;
+  try {
+    console.log('Calling webhook URL:', APPS_SCRIPT_WEBHOOK);
+    const response = await fetch(APPS_SCRIPT_WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const text = await response.text().catch(() => '');
+    if (!response.ok) {
+      console.error('Webhook error status', response.status, text || '(no body)');
+      throw new Error(`Webhook responded with status ${response.status}`);
+    }
+    console.log('Webhook success', { status: response.status, body: text || '(empty)', payload });
+  } catch (error) {
+    console.error('Webhook forwarding failed (non-blocking):', error.message || error);
+  }
+}
+
+app.get('/api/check', async (req, res) => {
+  const normalized = normalizeDomain(req.query.domain);
+  if (!normalized) {
+    return res.status(400).json({ error: 'Nom de domaine invalide.' });
+  }
+
+  try {
+    const checkResult = await checkAvailability(normalized);
+
+    if (checkResult.available) {
+      return res.json({
+        domain: normalized,
+        available: true,
+        status: checkResult.status,
+        alternatives: [],
+      });
+    }
+
+    const variantCandidates = generateVariants(normalized);
+    const availabilityChecks = await Promise.all(
+      variantCandidates.map(async (candidate) => {
+        try {
+          const candidateResult = await checkAvailability(candidate);
+          return candidateResult.available
+            ? { domain: candidate, status: candidateResult.status }
+            : null;
+        } catch {
+          return null;
+        }
+      })
+    );
+
+    const alternatives = availabilityChecks.filter(Boolean);
+
+    return res.json({
+      domain: normalized,
+      available: false,
+      status: checkResult.status,
+      alternatives,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: 'Impossible de verifier le domaine.' });
+  }
+});
+
+function validateLocalPart(value) {
+  const local = (value || '').toLowerCase();
+  if (!local || local.length > 40 || !/^[a-z0-9-]+$/.test(local)) {
+    return null;
+  }
+  return local;
+}
+
+function getCompletionKey({ sessionId, email }) {
+  const bySession = (sessionId || '').trim();
+  if (bySession) return `session:${bySession}`;
+  const byEmail = (email || '').trim().toLowerCase();
+  if (byEmail) return `email:${byEmail}`;
+  return null;
+}
+
+async function markCompletion({ sessionId, email }) {
+  const key = getCompletionKey({ sessionId, email });
+  if (!key) return;
+  await ensureCompletionsFile();
+  const raw = await fs.readFile(COMPLETIONS_PATH, 'utf8');
+  const store = raw ? JSON.parse(raw) : {};
+  store[key] = {
+    completed: true,
+    completedAt: new Date().toISOString(),
+  };
+  await fs.writeFile(COMPLETIONS_PATH, JSON.stringify(store, null, 2), 'utf8');
+}
+
+async function isCompleted({ sessionId, email }) {
+  const key = getCompletionKey({ sessionId, email });
+  if (!key) return false;
+  try {
+    await ensureCompletionsFile();
+    const raw = await fs.readFile(COMPLETIONS_PATH, 'utf8');
+    const store = raw ? JSON.parse(raw) : {};
+    return Boolean(store[key]?.completed);
+  } catch {
+    return false;
+  }
+}
+
+app.get('/api/completion', async (req, res) => {
+  const sessionId = (req.query.session_id || req.query.token || '').trim();
+  const email = (req.query.email || '').trim().toLowerCase();
+
+  const completed = await isCompleted({ sessionId, email });
+  return res.json({ completed });
+});
+
+app.post('/api/selection', async (req, res) => {
+  const normalizedChosen = normalizeDomain(req.body?.chosenDomain || req.body?.domain);
+  const normalizedRequested = normalizeDomain(
+    req.body?.requestedDomain || req.body?.domain || req.body?.chosenDomain
+  );
+  const localPart = validateLocalPart(req.body?.localPart);
+  const honeypot = (req.body?.honeypot || '').trim();
+  const clientEmail = (req.body?.currentEmail || req.body?.clientEmail || '')
+    .trim()
+    .toLowerCase();
+  const sessionId = (req.body?.sessionId || '').trim();
+  const hasExistingDomain = (req.body?.hasExistingDomain || '').trim();
+  const displayName = (req.body?.displayName || '').trim();
+  const comment = (req.body?.comment || '').trim();
+  const fullName = (req.body?.fullName || '').trim();
+  const company = (req.body?.company || '').trim();
+
+  if (req.rawBodyLength && req.rawBodyLength > 10240) {
+    return res.status(400).json({ error: 'Données invalides.' });
+  }
+  if (honeypot) {
+    return res.status(400).json({ error: 'Données invalides.' });
+  }
+  if (!normalizedChosen || !localPart) {
+    return res.status(400).json({ error: 'Données invalides.' });
+  }
+  if (clientEmail && !emailRegex.test(clientEmail)) {
+    return res.status(400).json({ error: 'Données invalides.' });
+  }
+  if (!DISABLE_COMPLETION_GUARD && (await isCompleted({ sessionId, email: clientEmail }))) {
+    return res.status(400).json({ error: 'Formulaire déjà complété.' });
+  }
+
+  try {
+    await ensureSelectionsFile();
+    const data = await fs.readFile(SELECTIONS_PATH, 'utf8');
+    const selections = data ? JSON.parse(data) : [];
+    const record = {
+      domain: normalizedChosen,
+      requestedDomain: normalizedRequested || null,
+      localPart,
+      clientEmail: clientEmail || null,
+      chosenAt: new Date().toISOString(),
+      hasExistingDomain: hasExistingDomain || null,
+      displayName: displayName || null,
+      comment: comment || null,
+      fullName: fullName || null,
+      company: company || null,
+      sessionId: sessionId || null,
+    };
+    selections.push(record);
+    await fs.writeFile(SELECTIONS_PATH, JSON.stringify(selections, null, 2), 'utf8');
+    await sendNotification(record);
+    forwardToWebhook({
+      fullName: fullName || null,
+      company: company || null,
+      currentEmail: clientEmail || null,
+      hasExistingDomain: hasExistingDomain || null,
+      requestedDomain: normalizedRequested || normalizedChosen,
+      chosenDomain: normalizedChosen,
+      localPart,
+      displayName: displayName || null,
+      comment: comment || null,
+    });
+    if (!DISABLE_COMPLETION_GUARD) {
+      await markCompletion({ sessionId, email: clientEmail });
+    }
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ error: "Impossible d'enregistrer le choix." });
+  }
+});
+
+// Serve the frontend for any other route (root or refresh)
+app.use((req, res) => {
+  if (req.path === '/merci') {
+    return res.sendFile(path.join(__dirname, 'public', 'merci.html'));
+  }
+  if (req.path === '/deja-complete') {
+    return res.sendFile(path.join(__dirname, 'public', 'deja-complete.html'));
+  }
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(PORT, () => {
+  console.log(`Server ready on http://localhost:${PORT}`);
+});
