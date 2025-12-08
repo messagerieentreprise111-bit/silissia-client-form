@@ -34,6 +34,14 @@ app.use(
 );
 app.use(express.static(path.join(__dirname, 'public')));
 
+app.get('/config.js', (req, res) => {
+  res.type('application/javascript').set('Cache-Control', 'no-store').send(
+    `window.APP_CONFIG = ${JSON.stringify({
+      disableCompletionGuard: DISABLE_COMPLETION_GUARD,
+    })};`
+  );
+});
+
 const availabilityKeys = ['available', 'inactive', 'undelegated'];
 const domainRegex = /^[a-z0-9-]+\.[a-z]{2,24}$/;
 const emailRegex =
@@ -239,35 +247,64 @@ function validateLocalPart(value) {
   return local;
 }
 
-function getCompletionKey({ sessionId, email }) {
+function getCompletionKeys({ sessionId, email }) {
+  const keys = [];
   const bySession = (sessionId || '').trim();
-  if (bySession) return `session:${bySession}`;
   const byEmail = (email || '').trim().toLowerCase();
-  if (byEmail) return `email:${byEmail}`;
-  return null;
+
+  if (bySession) {
+    keys.push(`session:${bySession}`);
+  } else if (byEmail) {
+    keys.push(`email:${byEmail}`);
+  }
+  return keys;
 }
 
-async function markCompletion({ sessionId, email }) {
-  const key = getCompletionKey({ sessionId, email });
-  if (!key) return;
+function hasAccessContext({ sessionId, email }) {
+  return Boolean((sessionId || '').trim() || (email || '').trim());
+}
+
+async function markCompletion({ sessionId, email, meta = {} }) {
+  const keys = getCompletionKeys({ sessionId, email });
+  if (!keys.length) return;
   await ensureCompletionsFile();
   const raw = await fs.readFile(COMPLETIONS_PATH, 'utf8');
   const store = raw ? JSON.parse(raw) : {};
-  store[key] = {
+  const entry = {
     completed: true,
     completedAt: new Date().toISOString(),
+    meta,
   };
+  for (const key of keys) {
+    store[key] = entry;
+  }
   await fs.writeFile(COMPLETIONS_PATH, JSON.stringify(store, null, 2), 'utf8');
 }
 
 async function isCompleted({ sessionId, email }) {
-  const key = getCompletionKey({ sessionId, email });
-  if (!key) return false;
+  const keys = getCompletionKeys({ sessionId, email });
+  if (!keys.length) return false;
   try {
     await ensureCompletionsFile();
     const raw = await fs.readFile(COMPLETIONS_PATH, 'utf8');
     const store = raw ? JSON.parse(raw) : {};
-    return Boolean(store[key]?.completed);
+    const hit = keys.find((key) => store[key]?.completed);
+    const completed = Boolean(hit);
+    if (completed) {
+      console.warn('Completion guard hit', {
+        sessionId: sessionId || '(none)',
+        email: email || '(none)',
+        key: hit,
+      });
+    } else {
+      console.log('Completion guard check', {
+        sessionId: sessionId || '(none)',
+        email: email || '(none)',
+        keys,
+        completed: false,
+      });
+    }
+    return completed;
   } catch {
     return false;
   }
@@ -276,6 +313,15 @@ async function isCompleted({ sessionId, email }) {
 app.get('/api/completion', async (req, res) => {
   const sessionId = (req.query.session_id || req.query.token || '').trim();
   const email = (req.query.email || '').trim().toLowerCase();
+
+  if (!DISABLE_COMPLETION_GUARD && !hasAccessContext({ sessionId, email })) {
+    console.warn('Completion check denied: missing context', {
+      path: req.originalUrl,
+      sessionId: sessionId || '(none)',
+      email: email || '(none)',
+    });
+    return res.status(400).json({ error: 'Accès non valide.' });
+  }
 
   const completed = await isCompleted({ sessionId, email });
   return res.json({ completed });
@@ -311,7 +357,20 @@ app.post('/api/selection', async (req, res) => {
     return res.status(400).json({ error: 'Données invalides.' });
   }
   if (!DISABLE_COMPLETION_GUARD && (await isCompleted({ sessionId, email: clientEmail }))) {
+    console.warn('Selection rejected: already completed', {
+      sessionId: sessionId || '(none)',
+      email: clientEmail || '(none)',
+      path: req.originalUrl,
+    });
     return res.status(400).json({ error: 'Formulaire déjà complété.' });
+  }
+  if (!DISABLE_COMPLETION_GUARD && !hasAccessContext({ sessionId, email: clientEmail })) {
+    console.warn('Selection rejected: missing context', {
+      sessionId: sessionId || '(none)',
+      email: clientEmail || '(none)',
+      path: req.originalUrl,
+    });
+    return res.status(400).json({ error: 'Accès non valide.' });
   }
 
   try {
@@ -346,7 +405,20 @@ app.post('/api/selection', async (req, res) => {
       comment: comment || null,
     });
     if (!DISABLE_COMPLETION_GUARD) {
-      await markCompletion({ sessionId, email: clientEmail });
+      await markCompletion({
+        sessionId,
+        email: clientEmail,
+        meta: {
+          domain: normalizedChosen,
+          requestedDomain: normalizedRequested || null,
+          hasExistingDomain: hasExistingDomain || null,
+          displayName: displayName || null,
+          fullName: fullName || null,
+          company: company || null,
+          ip: req.ip,
+          userAgent: req.headers['user-agent'] || '',
+        },
+      });
     }
 
     return res.json({ success: true });
@@ -363,6 +435,9 @@ app.use((req, res) => {
   }
   if (req.path === '/deja-complete') {
     return res.sendFile(path.join(__dirname, 'public', 'deja-complete.html'));
+  }
+  if (req.path === '/acces-non-valide') {
+    return res.sendFile(path.join(__dirname, 'public', 'acces-non-valide.html'));
   }
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });

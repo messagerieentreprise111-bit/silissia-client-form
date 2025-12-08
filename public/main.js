@@ -32,7 +32,13 @@ const localRegex = /^[a-z0-9-]{1,40}$/;
 const urlParams = new URLSearchParams(window.location.search);
 const sessionIdParam = urlParams.get('session_id') || urlParams.get('token') || '';
 const emailParam = (urlParams.get('email') || '').trim().toLowerCase();
-const disableCompletionGuard = false;
+const appConfig = window.APP_CONFIG || {};
+const disableCompletionGuard = Boolean(appConfig.disableCompletionGuard);
+const hasAccessContext = Boolean(sessionIdParam || emailParam);
+
+if (!hasAccessContext && !disableCompletionGuard) {
+  window.location.href = '/acces-non-valide';
+}
 
 function setStatus(message, type = '') {
   statusArea.textContent = message || '';
@@ -358,7 +364,7 @@ if (existingDomainRadios.length && existingDomainInfo) {
 }
 
 async function guardCompletedState() {
-  if (disableCompletionGuard) return;
+  if (disableCompletionGuard || !hasAccessContext) return;
   try {
     const params = new URLSearchParams();
     if (sessionIdParam) params.set('session_id', sessionIdParam);
