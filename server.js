@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 3000;
 const FASTLY_API_TOKEN = process.env.FASTLY_API_TOKEN;
 const SELECTIONS_PATH = path.join(__dirname, 'data', 'selections.json');
 const COMPLETIONS_PATH = path.join(__dirname, 'data', 'completions.json');
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || '';
 const SMTP_HOST = process.env.SMTP_HOST;
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
 const SMTP_USER = process.env.SMTP_USER;
@@ -25,6 +26,9 @@ if (!FASTLY_API_TOKEN) {
   console.error('Missing FASTLY_API_TOKEN in .env');
   process.exit(1);
 }
+
+// Behind Render's proxy we need trust proxy so rate-limit and IPs work
+app.set('trust proxy', true);
 
 app.use(
   express.json({
@@ -49,8 +53,9 @@ const domainRegex = /^[a-z0-9-]+\.[a-z]{2,24}$/;
 const emailRegex =
   /^[\w.!#$%&'*+/=?^`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
 
+const sendGridEnabled = Boolean(SENDGRID_API_KEY);
 const mailer =
-  SMTP_HOST && SMTP_USER && SMTP_PASS
+  !sendGridEnabled && SMTP_HOST && SMTP_USER && SMTP_PASS
     ? nodemailer.createTransport({
         host: SMTP_HOST,
         port: SMTP_PORT,
@@ -62,6 +67,43 @@ const mailer =
         timeout: 5000,
       })
     : null;
+
+console.log('SMTP config summary', {
+  enabled: Boolean(mailer),
+  host: SMTP_HOST || '(none)',
+  port: SMTP_PORT || '(none)',
+  secure: SMTP_PORT === 465,
+  from: SMTP_FROM || '(none)',
+  to: SMTP_TO || '(none)',
+});
+console.log('SendGrid config summary', {
+  enabled: sendGridEnabled,
+  from: SMTP_FROM || '(none)',
+  to: SMTP_TO || '(none)',
+});
+console.log('Apps Script webhook', {
+  configured: Boolean(APPS_SCRIPT_WEBHOOK),
+  url: APPS_SCRIPT_WEBHOOK || '(none)',
+  timeoutMs: WEBHOOK_TIMEOUT_MS,
+});
+
+if (mailer) {
+  withTimeout(mailer.verify(), 6000, 'SMTP verify')
+    .then(() => {
+      console.log('SMTP verify success (connection OK)');
+    })
+    .catch((error) => {
+      console.error('SMTP verify failed (non-blocking)', {
+        message: error.message || error,
+        code: error.code,
+        response: error.response,
+        command: error.command,
+        host: SMTP_HOST || '(none)',
+        port: SMTP_PORT || '(none)',
+        secure: SMTP_PORT === 465,
+      });
+    });
+}
 
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -191,12 +233,7 @@ function withTimeout(promise, ms, label = 'Operation') {
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
 }
 
-async function sendNotification({ domain, localPart, clientEmail }) {
-  if (!mailer) {
-    console.warn('SMTP settings missing, skipping email notification.');
-    return;
-  }
-
+function buildNotificationContent({ domain, localPart, clientEmail }) {
   const subject = `Nouveau choix de domaine : ${domain}`;
   const text = [
     'Un client a confirme un domaine.',
@@ -205,22 +242,113 @@ async function sendNotification({ domain, localPart, clientEmail }) {
     `Email client : ${clientEmail || '(non renseigne)'}`,
   ].join('\n');
 
-  const sendPromise = mailer.sendMail({
-    from: SMTP_FROM,
-    to: SMTP_TO,
-    subject,
-    text,
-  });
+  return { subject, text };
+}
 
-  await withTimeout(sendPromise, NOTIFICATION_TIMEOUT_MS, 'Email notification');
+async function sendWithSendGrid({ subject, text }) {
+  const payload = {
+    personalizations: [
+      {
+        to: [{ email: SMTP_TO }],
+        subject,
+      },
+    ],
+    from: { email: SMTP_FROM },
+    content: [{ type: 'text/plain', value: text }],
+  };
+
+  try {
+    const response = await withTimeout(
+      fetch('https://api.sendgrid.com/v3/mail/send', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${SENDGRID_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      }),
+      NOTIFICATION_TIMEOUT_MS,
+      'SendGrid notification'
+    );
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(
+        `SendGrid responded with ${response.status} ${response.statusText}: ${body || '(empty)'}`
+      );
+    }
+
+    console.log('SendGrid notification sent', {
+      to: SMTP_TO,
+      subject,
+      status: response.status,
+    });
+  } catch (error) {
+    console.error('SendGrid notification failed', {
+      message: error.message || error,
+      to: SMTP_TO,
+      subject,
+    });
+    throw error;
+  }
+}
+
+async function sendWithSmtp({ subject, text, domain, clientEmail }) {
+  if (!mailer) {
+    console.warn('SMTP settings missing, skipping email notification.');
+    return;
+  }
+
+  try {
+    const sendPromise = mailer.sendMail({
+      from: SMTP_FROM,
+      to: SMTP_TO,
+      subject,
+      text,
+    });
+
+    const info = await withTimeout(sendPromise, NOTIFICATION_TIMEOUT_MS, 'Email notification');
+    console.log('Notification email sent', {
+      to: SMTP_TO,
+      subject,
+      accepted: info?.accepted || [],
+      rejected: info?.rejected || [],
+      response: info?.response || '(no response)',
+    });
+  } catch (error) {
+    console.error('SMTP notification failed', {
+      message: error.message || error,
+      code: error.code,
+      response: error.response,
+      command: error.command,
+      host: SMTP_HOST || '(none)',
+      port: SMTP_PORT || '(none)',
+      secure: SMTP_PORT === 465,
+      from: SMTP_FROM || '(none)',
+      to: SMTP_TO || '(none)',
+      domain: domain || '(none)',
+      clientEmail: clientEmail || '(none)',
+    });
+    throw error;
+  }
+}
+
+async function sendNotification({ domain, localPart, clientEmail }) {
+  const { subject, text } = buildNotificationContent({ domain, localPart, clientEmail });
+
+  if (sendGridEnabled) {
+    await sendWithSendGrid({ subject, text });
+    return;
+  }
+
+  await sendWithSmtp({ subject, text, domain, clientEmail });
 }
 
 async function safeSendNotification(payload) {
   try {
     await sendNotification(payload);
   } catch (error) {
-    console.error('Notification failed (non-blocking)', {
-      error: error.message || error,
+    console.error('Notification failed (non-blocking, already logged)', {
       domain: payload?.domain,
       clientEmail: payload?.clientEmail || '(none)',
     });
@@ -242,12 +370,23 @@ async function forwardToWebhook(payload) {
     );
     const text = await response.text().catch(() => '');
     if (!response.ok) {
-      console.error('Webhook error status', response.status, text || '(no body)');
+      console.error('Webhook call failed', {
+        url: APPS_SCRIPT_WEBHOOK,
+        status: response.status,
+        statusText: response.statusText,
+        body: text || '(no body)',
+        payload,
+      });
       throw new Error(`Webhook responded with status ${response.status}`);
     }
     console.log('Webhook success', { status: response.status, body: text || '(empty)', payload });
   } catch (error) {
-    console.error('Webhook forwarding failed (non-blocking):', error.message || error);
+    console.error('Webhook forwarding failed (non-blocking):', {
+      url: APPS_SCRIPT_WEBHOOK || '(none)',
+      error: error.message || error,
+      name: error.name,
+      timeoutMs: WEBHOOK_TIMEOUT_MS,
+    });
   }
 }
 
