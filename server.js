@@ -18,6 +18,8 @@ const SMTP_FROM = process.env.SMTP_FROM || SMTP_USER;
 const SMTP_TO = process.env.NOTIFY_TO || 'contact@silissia.com';
 const DISABLE_COMPLETION_GUARD = process.env.DISABLE_COMPLETION_GUARD === 'true';
 const APPS_SCRIPT_WEBHOOK = process.env.APPS_SCRIPT_WEBHOOK || '';
+const NOTIFICATION_TIMEOUT_MS = 8000;
+const WEBHOOK_TIMEOUT_MS = 5000;
 
 if (!FASTLY_API_TOKEN) {
   console.error('Missing FASTLY_API_TOKEN in .env');
@@ -54,6 +56,10 @@ const mailer =
         port: SMTP_PORT,
         secure: SMTP_PORT === 465,
         auth: { user: SMTP_USER, pass: SMTP_PASS },
+        connectionTimeout: 5000,
+        greetingTimeout: 5000,
+        socketTimeout: 5000,
+        timeout: 5000,
       })
     : null;
 
@@ -133,22 +139,56 @@ async function checkAvailability(domain) {
   };
 }
 
-async function ensureSelectionsFile() {
-  await fs.mkdir(path.dirname(SELECTIONS_PATH), { recursive: true });
+async function ensureFile(filePath, defaultContent) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
   try {
-    await fs.access(SELECTIONS_PATH);
+    await fs.access(filePath);
   } catch {
-    await fs.writeFile(SELECTIONS_PATH, '[]', 'utf8');
+    await fs.writeFile(filePath, defaultContent, 'utf8');
   }
 }
 
-async function ensureCompletionsFile() {
-  await fs.mkdir(path.dirname(COMPLETIONS_PATH), { recursive: true });
+async function readJsonFile(filePath, fallbackValue, label) {
+  await ensureFile(filePath, JSON.stringify(fallbackValue, null, 2));
   try {
-    await fs.access(COMPLETIONS_PATH);
-  } catch {
-    await fs.writeFile(COMPLETIONS_PATH, '{}', 'utf8');
+    const raw = await fs.readFile(filePath, 'utf8');
+    if (!raw.trim()) {
+      await fs.writeFile(filePath, JSON.stringify(fallbackValue, null, 2), 'utf8');
+      return fallbackValue;
+    }
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(fallbackValue) && Array.isArray(parsed)) {
+      return parsed;
+    }
+    if (!Array.isArray(fallbackValue) && parsed && typeof parsed === 'object') {
+      return parsed;
+    }
+    console.error(`${label} file has unexpected shape, resetting`, { filePath });
+    await fs.writeFile(filePath, JSON.stringify(fallbackValue, null, 2), 'utf8');
+    return fallbackValue;
+  } catch (error) {
+    console.error(`${label} file unreadable, resetting`, { filePath, error: error.message });
+    await fs.writeFile(filePath, JSON.stringify(fallbackValue, null, 2), 'utf8');
+    return fallbackValue;
   }
+}
+
+async function readSelections() {
+  return readJsonFile(SELECTIONS_PATH, [], 'selections');
+}
+
+async function readCompletions() {
+  return readJsonFile(COMPLETIONS_PATH, {}, 'completions');
+}
+
+function withTimeout(promise, ms, label = 'Operation') {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
 }
 
 async function sendNotification({ domain, localPart, clientEmail }) {
@@ -165,23 +205,41 @@ async function sendNotification({ domain, localPart, clientEmail }) {
     `Email client : ${clientEmail || '(non renseigne)'}`,
   ].join('\n');
 
-  await mailer.sendMail({
+  const sendPromise = mailer.sendMail({
     from: SMTP_FROM,
     to: SMTP_TO,
     subject,
     text,
   });
+
+  await withTimeout(sendPromise, NOTIFICATION_TIMEOUT_MS, 'Email notification');
+}
+
+async function safeSendNotification(payload) {
+  try {
+    await sendNotification(payload);
+  } catch (error) {
+    console.error('Notification failed (non-blocking)', {
+      error: error.message || error,
+      domain: payload?.domain,
+      clientEmail: payload?.clientEmail || '(none)',
+    });
+  }
 }
 
 async function forwardToWebhook(payload) {
   if (!APPS_SCRIPT_WEBHOOK) return;
   try {
     console.log('Calling webhook URL:', APPS_SCRIPT_WEBHOOK);
-    const response = await fetch(APPS_SCRIPT_WEBHOOK, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    const response = await withTimeout(
+      fetch(APPS_SCRIPT_WEBHOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }),
+      WEBHOOK_TIMEOUT_MS,
+      'Webhook call'
+    );
     const text = await response.text().catch(() => '');
     if (!response.ok) {
       console.error('Webhook error status', response.status, text || '(no body)');
@@ -267,9 +325,7 @@ function hasAccessContext({ sessionId, email }) {
 async function markCompletion({ sessionId, email, meta = {} }) {
   const keys = getCompletionKeys({ sessionId, email });
   if (!keys.length) return;
-  await ensureCompletionsFile();
-  const raw = await fs.readFile(COMPLETIONS_PATH, 'utf8');
-  const store = raw ? JSON.parse(raw) : {};
+  const store = await readCompletions();
   const entry = {
     completed: true,
     completedAt: new Date().toISOString(),
@@ -285,9 +341,7 @@ async function isCompleted({ sessionId, email }) {
   const keys = getCompletionKeys({ sessionId, email });
   if (!keys.length) return false;
   try {
-    await ensureCompletionsFile();
-    const raw = await fs.readFile(COMPLETIONS_PATH, 'utf8');
-    const store = raw ? JSON.parse(raw) : {};
+    const store = await readCompletions();
     const hit = keys.find((key) => store[key]?.completed);
     const completed = Boolean(hit);
     if (completed) {
@@ -374,9 +428,7 @@ app.post('/api/selection', async (req, res) => {
   }
 
   try {
-    await ensureSelectionsFile();
-    const data = await fs.readFile(SELECTIONS_PATH, 'utf8');
-    const selections = data ? JSON.parse(data) : [];
+    const selections = await readSelections();
     const record = {
       domain: normalizedChosen,
       requestedDomain: normalizedRequested || null,
@@ -392,18 +444,20 @@ app.post('/api/selection', async (req, res) => {
     };
     selections.push(record);
     await fs.writeFile(SELECTIONS_PATH, JSON.stringify(selections, null, 2), 'utf8');
-    await sendNotification(record);
-    forwardToWebhook({
-      fullName: fullName || null,
-      company: company || null,
-      currentEmail: clientEmail || null,
-      hasExistingDomain: hasExistingDomain || null,
-      requestedDomain: normalizedRequested || normalizedChosen,
-      chosenDomain: normalizedChosen,
-      localPart,
-      displayName: displayName || null,
-      comment: comment || null,
-    });
+    Promise.allSettled([
+      safeSendNotification(record),
+      forwardToWebhook({
+        fullName: fullName || null,
+        company: company || null,
+        currentEmail: clientEmail || null,
+        hasExistingDomain: hasExistingDomain || null,
+        requestedDomain: normalizedRequested || normalizedChosen,
+        chosenDomain: normalizedChosen,
+        localPart,
+        displayName: displayName || null,
+        comment: comment || null,
+      }),
+    ]).catch(() => {});
     if (!DISABLE_COMPLETION_GUARD) {
       await markCompletion({
         sessionId,
@@ -423,7 +477,14 @@ app.post('/api/selection', async (req, res) => {
 
     return res.json({ success: true });
   } catch (error) {
-    console.error(error);
+    console.error('Selection save failed', {
+      error: error.message || error,
+      chosenDomain: normalizedChosen,
+      requestedDomain: normalizedRequested || '(none)',
+      sessionId: sessionId || '(none)',
+      clientEmail: clientEmail || '(none)',
+      path: req.originalUrl,
+    });
     return res.status(500).json({ error: "Impossible d'enregistrer le choix." });
   }
 });
