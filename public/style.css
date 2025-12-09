@@ -106,6 +106,20 @@ body::before {
   line-height: 1.6;
 }
 
+.hero-actions {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.hero-note {
+  margin: 0;
+  color: rgba(248, 250, 252, 0.8);
+  font-size: 0.95rem;
+}
+
 .form-grid {
   display: grid;
   gap: 18px;

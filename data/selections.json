@@ -494,5 +494,44 @@
     "fullName": "Dernier",
     "company": "Test",
     "sessionId": null
+  },
+  {
+    "domain": "bobobi.fr",
+    "requestedDomain": "bobobi.fr",
+    "localPart": "bobo",
+    "clientEmail": "messagerie.entreprise111@gmail.com",
+    "chosenAt": "2025-12-08T01:19:49.571Z",
+    "hasExistingDomain": "no",
+    "displayName": "bobo",
+    "comment": null,
+    "fullName": "test",
+    "company": "testons",
+    "sessionId": null
+  },
+  {
+    "domain": "jujjujo.fr",
+    "requestedDomain": "jujjujo.fr",
+    "localPart": "juju",
+    "clientEmail": "juliendurant015@gmail.com",
+    "chosenAt": "2025-12-09T00:36:46.695Z",
+    "hasExistingDomain": "no",
+    "displayName": "test",
+    "comment": null,
+    "fullName": "test",
+    "company": "testons",
+    "sessionId": null
+  },
+  {
+    "domain": "ninananio.fr",
+    "requestedDomain": "ninananio.fr",
+    "localPart": "mailito",
+    "clientEmail": "agencevoxety@gmail.com",
+    "chosenAt": "2025-12-09T00:56:48.457Z",
+    "hasExistingDomain": "no",
+    "displayName": "mailito",
+    "comment": null,
+    "fullName": "mail",
+    "company": "mail",
+    "sessionId": null
   }
 ]

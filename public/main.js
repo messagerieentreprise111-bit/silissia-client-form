@@ -30,13 +30,11 @@ let confirmedDomain = '';
 let isSubmitting = false;
 const localRegex = /^[a-z0-9-]{1,40}$/;
 const urlParams = new URLSearchParams(window.location.search);
-const sessionIdParam = urlParams.get('session_id') || urlParams.get('token') || '';
-const emailParam = (urlParams.get('email') || '').trim().toLowerCase();
+const sessionIdParam = urlParams.get('session_id') || '';
 const appConfig = window.APP_CONFIG || {};
 const disableCompletionGuard = Boolean(appConfig.disableCompletionGuard);
-const hasAccessContext = Boolean(sessionIdParam || emailParam);
 
-if (!hasAccessContext && !disableCompletionGuard) {
+if (!disableCompletionGuard && !sessionIdParam) {
   window.location.href = '/acces-non-valide';
 }
 
@@ -228,6 +226,10 @@ async function submitSelection() {
   const hasExistingDomain =
     Array.from(existingDomainRadios || []).find((r) => r.checked)?.value || '';
   if (isSubmitting) return;
+  if (!disableCompletionGuard && !sessionIdParam && !(sessionInput?.value || '').trim()) {
+    setStatus('Effectuez le paiement avant de remplir le formulaire.', 'error');
+    return;
+  }
   const payload = {
     fullName: (form.fullName?.value || '').trim(),
     company: (form.company?.value || '').trim(),
@@ -364,15 +366,22 @@ if (existingDomainRadios.length && existingDomainInfo) {
 }
 
 async function guardCompletedState() {
-  if (disableCompletionGuard || !hasAccessContext) return;
+  if (disableCompletionGuard || !sessionIdParam) return;
   try {
     const params = new URLSearchParams();
     if (sessionIdParam) params.set('session_id', sessionIdParam);
-    if (emailParam) params.set('email', emailParam);
     const qs = params.toString();
     if (!qs) return;
     const response = await fetch(`${apiBase}/api/completion?${qs}`);
+    if (!response.ok) {
+      window.location.href = '/acces-non-valide';
+      return;
+    }
     const payload = await response.json();
+    if (!payload?.paid) {
+      window.location.href = '/acces-non-valide';
+      return;
+    }
     if (payload?.completed) {
       window.location.href = '/deja-complete';
     }

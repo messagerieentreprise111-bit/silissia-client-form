@@ -4,6 +4,8 @@ const path = require('path');
 const fs = require('fs/promises');
 const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
+const Stripe = require('stripe');
+const logger = require('./logger');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,15 +22,39 @@ const SMTP_TO = process.env.NOTIFY_TO || 'contact@silissia.com';
 const DISABLE_COMPLETION_GUARD = process.env.DISABLE_COMPLETION_GUARD === 'true';
 const APPS_SCRIPT_WEBHOOK = process.env.APPS_SCRIPT_WEBHOOK || '';
 const NOTIFICATION_TIMEOUT_MS = 8000;
-const WEBHOOK_TIMEOUT_MS = 5000;
+const APPS_SCRIPT_TIMEOUT_MS = parseInt(process.env.APPS_SCRIPT_TIMEOUT_MS || '12000', 10);
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_SETUP_PRICE_ID = process.env.STRIPE_SETUP_PRICE_ID || '';
+const STRIPE_SUBSCRIPTION_PRICE_ID = process.env.STRIPE_SUBSCRIPTION_PRICE_ID || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const stripe = STRIPE_SECRET_KEY
+  ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' })
+  : null;
 
 if (!FASTLY_API_TOKEN) {
-  console.error('Missing FASTLY_API_TOKEN in .env');
+  logger.error('process', 'Missing FASTLY_API_TOKEN in environment', { hasToken: Boolean(FASTLY_API_TOKEN) });
   process.exit(1);
 }
 
+process.on('unhandledRejection', (reason) => {
+  logger.error('process', 'Unhandled promise rejection', {
+    reason: reason?.message || reason,
+    stack: reason?.stack,
+  });
+});
+
+process.on('uncaughtException', (error) => {
+  logger.error('process', 'Uncaught exception', {
+    message: error?.message || error,
+    stack: error?.stack,
+  });
+});
+
 // Behind Render's proxy we need trust proxy so rate-limit and IPs work
 app.set('trust proxy', true);
+
+// Stripe webhooks need the raw body for signature verification
+app.use('/webhook/stripe', express.raw({ type: 'application/json' }));
 
 app.use(
   express.json({
@@ -68,7 +94,7 @@ const mailer =
       })
     : null;
 
-console.log('SMTP config summary', {
+logger.info('process', 'SMTP config summary', {
   enabled: Boolean(mailer),
   host: SMTP_HOST || '(none)',
   port: SMTP_PORT || '(none)',
@@ -76,24 +102,34 @@ console.log('SMTP config summary', {
   from: SMTP_FROM || '(none)',
   to: SMTP_TO || '(none)',
 });
-console.log('SendGrid config summary', {
+logger.info('process', 'SendGrid config summary', {
   enabled: sendGridEnabled,
   from: SMTP_FROM || '(none)',
   to: SMTP_TO || '(none)',
 });
-console.log('Apps Script webhook', {
+logger.info('process', 'Stripe config summary', {
+  enabled: Boolean(stripe),
+  hasSetupPrice: Boolean(STRIPE_SETUP_PRICE_ID),
+  hasSubscriptionPrice: Boolean(STRIPE_SUBSCRIPTION_PRICE_ID),
+  webhookConfigured: Boolean(STRIPE_WEBHOOK_SECRET),
+});
+logger.info('process', 'Apps Script webhook config', {
   configured: Boolean(APPS_SCRIPT_WEBHOOK),
   url: APPS_SCRIPT_WEBHOOK || '(none)',
-  timeoutMs: WEBHOOK_TIMEOUT_MS,
+  timeoutMs: APPS_SCRIPT_TIMEOUT_MS,
 });
 
 if (mailer) {
   withTimeout(mailer.verify(), 6000, 'SMTP verify')
     .then(() => {
-      console.log('SMTP verify success (connection OK)');
+      logger.info('process', 'SMTP verify success', {
+        host: SMTP_HOST || '(none)',
+        port: SMTP_PORT || '(none)',
+        secure: SMTP_PORT === 465,
+      });
     })
     .catch((error) => {
-      console.error('SMTP verify failed (non-blocking)', {
+      logger.error('process', 'SMTP verify failed (non-blocking)', {
         message: error.message || error,
         code: error.code,
         response: error.response,
@@ -113,6 +149,16 @@ const apiLimiter = rateLimit({
   message: { error: 'Trop de requetes. Merci de reessayer dans une minute.' },
 });
 app.use('/api/', apiLimiter);
+
+function getPublicBaseUrl(req) {
+  const envUrl = (process.env.PUBLIC_BASE_URL || '').trim();
+  if (envUrl) {
+    return envUrl.replace(/\/+$/, '');
+  }
+  const host = req.get('host') || '';
+  const protocol = req.protocol || 'https';
+  return `${protocol}://${host}`;
+}
 
 function normalizeDomain(raw) {
   if (!raw) return null;
@@ -181,21 +227,38 @@ async function checkAvailability(domain) {
   };
 }
 
-async function ensureFile(filePath, defaultContent) {
+async function writeJsonFile(filePath, data, label) {
+  try {
+    await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
+  } catch (error) {
+    logger.error('json-store', `${label} write failed`, {
+      filePath,
+      message: error.message || error,
+      code: error.code,
+    });
+    throw error;
+  }
+}
+
+async function ensureJsonFile(filePath, fallbackValue, label) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   try {
     await fs.access(filePath);
-  } catch {
-    await fs.writeFile(filePath, defaultContent, 'utf8');
+    return false;
+  } catch (error) {
+    await writeJsonFile(filePath, fallbackValue, label);
+    logger.warn('json-store', `${label} file missing, created default`, { filePath });
+    return true;
   }
 }
 
 async function readJsonFile(filePath, fallbackValue, label) {
-  await ensureFile(filePath, JSON.stringify(fallbackValue, null, 2));
+  await ensureJsonFile(filePath, fallbackValue, label);
   try {
     const raw = await fs.readFile(filePath, 'utf8');
     if (!raw.trim()) {
-      await fs.writeFile(filePath, JSON.stringify(fallbackValue, null, 2), 'utf8');
+      logger.warn('json-store', `${label} file empty, resetting`, { filePath });
+      await writeJsonFile(filePath, fallbackValue, label);
       return fallbackValue;
     }
     const parsed = JSON.parse(raw);
@@ -205,13 +268,24 @@ async function readJsonFile(filePath, fallbackValue, label) {
     if (!Array.isArray(fallbackValue) && parsed && typeof parsed === 'object') {
       return parsed;
     }
-    console.error(`${label} file has unexpected shape, resetting`, { filePath });
-    await fs.writeFile(filePath, JSON.stringify(fallbackValue, null, 2), 'utf8');
+    logger.warn('json-store', `${label} file has unexpected shape, resetting`, { filePath });
+    await writeJsonFile(filePath, fallbackValue, label);
     return fallbackValue;
   } catch (error) {
-    console.error(`${label} file unreadable, resetting`, { filePath, error: error.message });
-    await fs.writeFile(filePath, JSON.stringify(fallbackValue, null, 2), 'utf8');
-    return fallbackValue;
+    if (error instanceof SyntaxError) {
+      logger.warn('json-store', `${label} file invalid JSON, resetting`, {
+        filePath,
+        message: error.message || error,
+      });
+      await writeJsonFile(filePath, fallbackValue, label);
+      return fallbackValue;
+    }
+    logger.error('json-store', `${label} file access failed`, {
+      filePath,
+      message: error.message || error,
+      code: error.code,
+    });
+    throw error;
   }
 }
 
@@ -245,7 +319,7 @@ function buildNotificationContent({ domain, localPart, clientEmail }) {
   return { subject, text };
 }
 
-async function sendWithSendGrid({ subject, text }) {
+async function sendWithSendGrid({ subject, text, domain, clientEmail }) {
   const payload = {
     personalizations: [
       {
@@ -256,6 +330,13 @@ async function sendWithSendGrid({ subject, text }) {
     from: { email: SMTP_FROM },
     content: [{ type: 'text/plain', value: text }],
   };
+
+  logger.info('sendgrid-notif', 'Sending SendGrid notification', {
+    to: SMTP_TO,
+    from: SMTP_FROM || '(none)',
+    domain: domain || '(none)',
+    clientEmail: clientEmail || '(none)',
+  });
 
   try {
     const response = await withTimeout(
@@ -278,16 +359,18 @@ async function sendWithSendGrid({ subject, text }) {
       );
     }
 
-    console.log('SendGrid notification sent', {
+    logger.info('sendgrid-notif', 'SendGrid notification sent', {
       to: SMTP_TO,
       subject,
       status: response.status,
     });
   } catch (error) {
-    console.error('SendGrid notification failed', {
+    logger.error('sendgrid-notif', 'SendGrid notification failed', {
       message: error.message || error,
       to: SMTP_TO,
       subject,
+      domain: domain || '(none)',
+      clientEmail: clientEmail || '(none)',
     });
     throw error;
   }
@@ -295,9 +378,19 @@ async function sendWithSendGrid({ subject, text }) {
 
 async function sendWithSmtp({ subject, text, domain, clientEmail }) {
   if (!mailer) {
-    console.warn('SMTP settings missing, skipping email notification.');
+    logger.warn('smtp-notif', 'SMTP settings missing, skipping email notification', {
+      domain: domain || '(none)',
+      clientEmail: clientEmail || '(none)',
+    });
     return;
   }
+
+  logger.info('smtp-notif', 'Sending SMTP notification', {
+    to: SMTP_TO,
+    from: SMTP_FROM || '(none)',
+    domain: domain || '(none)',
+    clientEmail: clientEmail || '(none)',
+  });
 
   try {
     const sendPromise = mailer.sendMail({
@@ -308,7 +401,7 @@ async function sendWithSmtp({ subject, text, domain, clientEmail }) {
     });
 
     const info = await withTimeout(sendPromise, NOTIFICATION_TIMEOUT_MS, 'Email notification');
-    console.log('Notification email sent', {
+    logger.info('smtp-notif', 'SMTP notification sent', {
       to: SMTP_TO,
       subject,
       accepted: info?.accepted || [],
@@ -316,7 +409,7 @@ async function sendWithSmtp({ subject, text, domain, clientEmail }) {
       response: info?.response || '(no response)',
     });
   } catch (error) {
-    console.error('SMTP notification failed', {
+    logger.error('smtp-notif', 'SMTP notification failed', {
       message: error.message || error,
       code: error.code,
       response: error.response,
@@ -337,7 +430,7 @@ async function sendNotification({ domain, localPart, clientEmail }) {
   const { subject, text } = buildNotificationContent({ domain, localPart, clientEmail });
 
   if (sendGridEnabled) {
-    await sendWithSendGrid({ subject, text });
+    await sendWithSendGrid({ subject, text, domain, clientEmail });
     return;
   }
 
@@ -348,29 +441,101 @@ async function safeSendNotification(payload) {
   try {
     await sendNotification(payload);
   } catch (error) {
-    console.error('Notification failed (non-blocking, already logged)', {
-      domain: payload?.domain,
+    logger.error('sendgrid-notif', 'Notification failed (non-blocking, already logged)', {
+      domain: payload?.domain || '(none)',
       clientEmail: payload?.clientEmail || '(none)',
     });
+  }
+}
+
+async function sendStripeWebhookAlert({ eventType, sessionId, errorMessage }) {
+  const subject = 'ALERTE : erreur webhook Stripe';
+  const text = [
+    'Une erreur est survenue lors du traitement du webhook Stripe.',
+    `Type d'evenement : ${eventType || '(inconnu)'}`,
+    `Session ID : ${sessionId || '(inconnu)'}`,
+    `Erreur : ${errorMessage || '(aucun message)'}`,
+  ].join('\n');
+
+  try {
+    if (sendGridEnabled) {
+      await sendWithSendGrid({ subject, text });
+    } else {
+      await sendWithSmtp({ subject, text });
+    }
+    logger.info('stripe-alert', 'Stripe webhook alert email sent', {
+      eventType: eventType || '(unknown)',
+      sessionId: sessionId || '(unknown)',
+    });
+  } catch (error) {
+    logger.error('stripe-alert', 'Stripe webhook alert email failed', {
+      message: error.message || error,
+      eventType: eventType || '(unknown)',
+      sessionId: sessionId || '(unknown)',
+    });
+  }
+}
+
+function extractStripeEventContext(event, rawBody) {
+  if (event) {
+    const dataObject = event?.data?.object || {};
+    return {
+      eventType: event.type || null,
+      sessionId:
+        dataObject.id ||
+        dataObject.session_id ||
+        dataObject.client_reference_id ||
+        dataObject.metadata?.session_id ||
+        null,
+    };
+  }
+
+  if (!rawBody) {
+    return { eventType: null, sessionId: null };
+  }
+
+  try {
+    const jsonString =
+      typeof rawBody === 'string' ? rawBody : rawBody?.toString ? rawBody.toString('utf8') : '';
+    const parsed = jsonString ? JSON.parse(jsonString) : null;
+    const dataObject = parsed?.data?.object || {};
+    return {
+      eventType: parsed?.type || null,
+      sessionId:
+        dataObject.id ||
+        dataObject.session_id ||
+        dataObject.client_reference_id ||
+        dataObject.metadata?.session_id ||
+        null,
+    };
+  } catch {
+    return { eventType: null, sessionId: null };
   }
 }
 
 async function forwardToWebhook(payload) {
   if (!APPS_SCRIPT_WEBHOOK) return;
   try {
-    console.log('Calling webhook URL:', APPS_SCRIPT_WEBHOOK);
+    logger.info('apps-script', 'Forwarding selection to Apps Script webhook', {
+      url: APPS_SCRIPT_WEBHOOK,
+      sessionId: payload?.sessionId || payload?.session_id || '(none)',
+      currentEmail: payload?.currentEmail || '(none)',
+      chosenDomain: payload?.chosenDomain || '(none)',
+      localPart: payload?.localPart || '(none)',
+      timeoutMs: APPS_SCRIPT_TIMEOUT_MS,
+    });
     const response = await withTimeout(
       fetch(APPS_SCRIPT_WEBHOOK, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       }),
-      WEBHOOK_TIMEOUT_MS,
+      APPS_SCRIPT_TIMEOUT_MS,
       'Webhook call'
     );
     const text = await response.text().catch(() => '');
     if (!response.ok) {
-      console.error('Webhook call failed', {
+      logger.error('apps-script', 'Apps Script webhook failed', {
         url: APPS_SCRIPT_WEBHOOK,
         status: response.status,
         statusText: response.statusText,
@@ -379,27 +544,41 @@ async function forwardToWebhook(payload) {
       });
       throw new Error(`Webhook responded with status ${response.status}`);
     }
-    console.log('Webhook success', { status: response.status, body: text || '(empty)', payload });
+    logger.info('apps-script', 'Apps Script webhook success', {
+      status: response.status,
+      body: text || '(empty)',
+      payload,
+    });
   } catch (error) {
-    console.error('Webhook forwarding failed (non-blocking):', {
+    logger.error('apps-script', 'Apps Script webhook failed (non-blocking)', {
       url: APPS_SCRIPT_WEBHOOK || '(none)',
-      error: error.message || error,
+      message: error.message || error,
       name: error.name,
-      timeoutMs: WEBHOOK_TIMEOUT_MS,
+      timeoutMs: APPS_SCRIPT_TIMEOUT_MS,
     });
   }
 }
 
 app.get('/api/check', async (req, res) => {
-  const normalized = normalizeDomain(req.query.domain);
+  const rawDomain = req.query.domain;
+  const normalized = normalizeDomain(rawDomain);
   if (!normalized) {
+    logger.warn('domain-check', 'Invalid domain parameter', {
+      rawDomain: rawDomain || '(none)',
+      path: req.originalUrl,
+    });
     return res.status(400).json({ error: 'Nom de domaine invalide.' });
   }
 
+  logger.info('domain-check', 'Domain availability check started', { domain: normalized });
   try {
     const checkResult = await checkAvailability(normalized);
 
     if (checkResult.available) {
+      logger.info('domain-check', 'Domain available', {
+        domain: normalized,
+        status: checkResult.status || '(none)',
+      });
       return res.json({
         domain: normalized,
         available: true,
@@ -423,6 +602,13 @@ app.get('/api/check', async (req, res) => {
     );
 
     const alternatives = availabilityChecks.filter(Boolean);
+    const shortAlternatives = alternatives.slice(0, 5).map((item) => item?.domain || '(unknown)');
+
+    logger.info('domain-check', 'Domain unavailable, proposing alternatives', {
+      domain: normalized,
+      status: checkResult.status || '(none)',
+      alternatives: shortAlternatives,
+    });
 
     return res.json({
       domain: normalized,
@@ -431,8 +617,11 @@ app.get('/api/check', async (req, res) => {
       alternatives,
     });
   } catch (error) {
-    console.error(error);
-    return res.status(500).json({ error: 'Impossible de verifier le domaine.' });
+    logger.error('domain-check', 'Domain availability check failed', {
+      domain: normalized,
+      message: error.message || error,
+    });
+    return res.status(502).json({ error: 'Impossible de verifier le domaine.' });
   }
 });
 
@@ -461,6 +650,34 @@ function hasAccessContext({ sessionId, email }) {
   return Boolean((sessionId || '').trim() || (email || '').trim());
 }
 
+async function upsertPaymentStatus({ sessionId, email, paymentStatus, paymentIntent, customerEmail }) {
+  const keys = getCompletionKeys({ sessionId, email: email || customerEmail });
+  if (!keys.length) return;
+  const store = await readCompletions();
+  const patch = {
+    paymentStatus: paymentStatus || null,
+    paymentIntent: paymentIntent || null,
+    customerEmail: customerEmail || email || null,
+    paymentUpdatedAt: new Date().toISOString(),
+  };
+
+  for (const key of keys) {
+    const existing = store[key] || {};
+    store[key] = {
+      ...existing,
+      ...patch,
+      meta: { ...(existing.meta || {}), ...(patch.meta || {}) },
+    };
+  }
+
+  await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
+  logger.info('selection', 'Stripe session status cached', {
+    keys,
+    paymentStatus: paymentStatus || '(none)',
+    paymentIntent: paymentIntent || '(none)',
+  });
+}
+
 async function markCompletion({ sessionId, email, meta = {} }) {
   const keys = getCompletionKeys({ sessionId, email });
   if (!keys.length) return;
@@ -471,35 +688,56 @@ async function markCompletion({ sessionId, email, meta = {} }) {
     meta,
   };
   for (const key of keys) {
-    store[key] = entry;
+    const existing = store[key] || {};
+    store[key] = {
+      ...existing,
+      ...entry,
+      meta: { ...(existing.meta || {}), ...(entry.meta || {}) },
+    };
   }
-  await fs.writeFile(COMPLETIONS_PATH, JSON.stringify(store, null, 2), 'utf8');
+  await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
+  logger.info('selection', 'Completion guard updated', {
+    keys,
+    sessionId: sessionId || '(none)',
+    email: email || '(none)',
+  });
 }
 
 async function isCompleted({ sessionId, email }) {
   const keys = getCompletionKeys({ sessionId, email });
-  if (!keys.length) return false;
+  if (!keys.length) return { completed: false, key: null };
+  const store = await readCompletions();
+  const hit = keys.find((key) => store[key]?.completed);
+  return { completed: Boolean(hit), key: hit || null };
+}
+
+async function getStripeSessionStatus(sessionId) {
+  if (!stripe || !sessionId) {
+    return { found: false, paid: false, paymentStatus: null };
+  }
+
   try {
-    const store = await readCompletions();
-    const hit = keys.find((key) => store[key]?.completed);
-    const completed = Boolean(hit);
-    if (completed) {
-      console.warn('Completion guard hit', {
-        sessionId: sessionId || '(none)',
-        email: email || '(none)',
-        key: hit,
-      });
-    } else {
-      console.log('Completion guard check', {
-        sessionId: sessionId || '(none)',
-        email: email || '(none)',
-        keys,
-        completed: false,
-      });
-    }
-    return completed;
-  } catch {
-    return false;
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const paid = session.payment_status === 'paid';
+    await upsertPaymentStatus({
+      sessionId,
+      paymentStatus: session.payment_status,
+      paymentIntent: session.payment_intent || null,
+      customerEmail: session.customer_details?.email || session.customer_email || null,
+    });
+    return {
+      found: true,
+      paid,
+      paymentStatus: session.payment_status,
+      session,
+    };
+  } catch (error) {
+    logger.error('stripe', 'Stripe session lookup failed', {
+      sessionId,
+      message: error.message || error,
+      type: error?.type,
+    });
+    return { found: false, paid: false, paymentStatus: null };
   }
 }
 
@@ -508,16 +746,47 @@ app.get('/api/completion', async (req, res) => {
   const email = (req.query.email || '').trim().toLowerCase();
 
   if (!DISABLE_COMPLETION_GUARD && !hasAccessContext({ sessionId, email })) {
-    console.warn('Completion check denied: missing context', {
+    logger.warn('selection', 'Completion check denied: missing context', {
       path: req.originalUrl,
       sessionId: sessionId || '(none)',
       email: email || '(none)',
     });
-    return res.status(400).json({ error: 'Accès non valide.' });
+    return res.status(400).json({ error: 'Acces non valide.' });
   }
 
-  const completed = await isCompleted({ sessionId, email });
-  return res.json({ completed });
+  try {
+    const { completed, key } = await isCompleted({ sessionId, email });
+    const stripeStatus = sessionId ? await getStripeSessionStatus(sessionId) : null;
+    if (!DISABLE_COMPLETION_GUARD && !stripeStatus?.paid) {
+      logger.warn('selection', 'Completion check denied: unpaid session', {
+        sessionId: sessionId || '(none)',
+        email: email || '(none)',
+        paymentStatus: stripeStatus?.paymentStatus || '(none)',
+      });
+      return res.status(402).json({ error: 'Paiement requis.' });
+    }
+    if (completed) {
+      logger.warn('selection', 'Completion already marked', {
+        sessionId: sessionId || '(none)',
+        email: email || '(none)',
+        key: key || '(none)',
+        path: req.originalUrl,
+      });
+    }
+    return res.json({
+      completed,
+      paymentStatus: stripeStatus?.paymentStatus || null,
+      paid: Boolean(stripeStatus?.paid),
+    });
+  } catch (error) {
+    logger.error('selection', 'Completion lookup failed', {
+      sessionId: sessionId || '(none)',
+      email: email || '(none)',
+      path: req.originalUrl,
+      message: error.message || error,
+    });
+    return res.status(500).json({ error: 'Erreur interne.' });
+  }
 });
 
 app.post('/api/selection', async (req, res) => {
@@ -537,33 +806,81 @@ app.post('/api/selection', async (req, res) => {
   const fullName = (req.body?.fullName || '').trim();
   const company = (req.body?.company || '').trim();
 
+  logger.info('selection', 'Selection payload received', {
+    sessionId: sessionId || '(none)',
+    currentEmail: clientEmail || '(none)',
+    chosenDomain: normalizedChosen || req.body?.chosenDomain || '(none)',
+    requestedDomain: normalizedRequested || req.body?.requestedDomain || '(none)',
+    localPart: localPart || '(invalid)',
+    path: req.originalUrl,
+  });
+
   if (req.rawBodyLength && req.rawBodyLength > 10240) {
-    return res.status(400).json({ error: 'Données invalides.' });
+    logger.warn('selection', 'Selection rejected: payload too large', {
+      rawBodyLength: req.rawBodyLength,
+      path: req.originalUrl,
+    });
+    return res.status(400).json({ error: 'Donnees invalides.' });
   }
   if (honeypot) {
-    return res.status(400).json({ error: 'Données invalides.' });
+    logger.warn('selection', 'Selection rejected: honeypot triggered', { path: req.originalUrl });
+    return res.status(400).json({ error: 'Donnees invalides.' });
   }
   if (!normalizedChosen || !localPart) {
-    return res.status(400).json({ error: 'Données invalides.' });
+    logger.warn('selection', 'Selection rejected: invalid domain or local part', {
+      chosenDomain: req.body?.chosenDomain || '(none)',
+      normalizedChosen: normalizedChosen || '(invalid)',
+      localPart: localPart || '(invalid)',
+      path: req.originalUrl,
+    });
+    return res.status(400).json({ error: 'Donnees invalides.' });
   }
   if (clientEmail && !emailRegex.test(clientEmail)) {
-    return res.status(400).json({ error: 'Données invalides.' });
-  }
-  if (!DISABLE_COMPLETION_GUARD && (await isCompleted({ sessionId, email: clientEmail }))) {
-    console.warn('Selection rejected: already completed', {
-      sessionId: sessionId || '(none)',
-      email: clientEmail || '(none)',
+    logger.warn('selection', 'Selection rejected: invalid client email', {
+      clientEmail: clientEmail || '(none)',
       path: req.originalUrl,
     });
-    return res.status(400).json({ error: 'Formulaire déjà complété.' });
+    return res.status(400).json({ error: 'Donnees invalides.' });
   }
-  if (!DISABLE_COMPLETION_GUARD && !hasAccessContext({ sessionId, email: clientEmail })) {
-    console.warn('Selection rejected: missing context', {
-      sessionId: sessionId || '(none)',
-      email: clientEmail || '(none)',
-      path: req.originalUrl,
-    });
-    return res.status(400).json({ error: 'Accès non valide.' });
+
+  if (!DISABLE_COMPLETION_GUARD) {
+    const { completed, key } = await isCompleted({ sessionId, email: clientEmail });
+    if (completed) {
+      logger.warn('selection', 'Form already completed', {
+        sessionId: sessionId || '(none)',
+        email: clientEmail || '(none)',
+        completionKey: key || '(none)',
+        path: req.originalUrl,
+      });
+      return res.status(400).json({ error: 'Formulaire deja complete.' });
+    }
+    if (!hasAccessContext({ sessionId, email: clientEmail })) {
+      logger.warn('selection', 'Selection rejected: missing context', {
+        sessionId: sessionId || '(none)',
+        email: clientEmail || '(none)',
+        path: req.originalUrl,
+      });
+      return res.status(400).json({ error: 'Acces non valide.' });
+    }
+    if (!sessionId) {
+      logger.warn('selection', 'Selection rejected: missing Stripe session', {
+        sessionId: '(none)',
+        email: clientEmail || '(none)',
+        path: req.originalUrl,
+      });
+      return res.status(400).json({ error: 'Acces non valide.' });
+    }
+
+    const stripeStatus = await getStripeSessionStatus(sessionId);
+    if (!stripeStatus?.paid) {
+      logger.warn('selection', 'Selection rejected: unpaid session', {
+        sessionId: sessionId || '(none)',
+        email: clientEmail || '(none)',
+        paymentStatus: stripeStatus?.paymentStatus || '(none)',
+        path: req.originalUrl,
+      });
+      return res.status(402).json({ error: 'Paiement requis.' });
+    }
   }
 
   try {
@@ -582,7 +899,13 @@ app.post('/api/selection', async (req, res) => {
       sessionId: sessionId || null,
     };
     selections.push(record);
-    await fs.writeFile(SELECTIONS_PATH, JSON.stringify(selections, null, 2), 'utf8');
+    await writeJsonFile(SELECTIONS_PATH, selections, 'selections');
+    logger.info('selection', 'Selection stored', {
+      chosenDomain: normalizedChosen,
+      sessionId: sessionId || '(none)',
+      email: clientEmail || '(none)',
+      requestedDomain: normalizedRequested || null,
+    });
     Promise.allSettled([
       safeSendNotification(record),
       forwardToWebhook({
@@ -616,8 +939,8 @@ app.post('/api/selection', async (req, res) => {
 
     return res.json({ success: true });
   } catch (error) {
-    console.error('Selection save failed', {
-      error: error.message || error,
+    logger.error('selection', 'Selection save failed', {
+      message: error.message || error,
       chosenDomain: normalizedChosen,
       requestedDomain: normalizedRequested || '(none)',
       sessionId: sessionId || '(none)',
@@ -626,6 +949,82 @@ app.post('/api/selection', async (req, res) => {
     });
     return res.status(500).json({ error: "Impossible d'enregistrer le choix." });
   }
+});
+
+app.post('/webhook/stripe', async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+    logger.warn('stripe', 'Webhook received but Stripe is not configured', {
+      hasStripe: Boolean(stripe),
+      hasWebhookSecret: Boolean(STRIPE_WEBHOOK_SECRET),
+    });
+    return res.status(400).send('Stripe non configure');
+  }
+
+  const signature = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, signature, STRIPE_WEBHOOK_SECRET);
+  } catch (error) {
+    logger.error('stripe', 'Webhook signature verification failed', {
+      message: error.message || error,
+      type: error?.type,
+    });
+    const context = extractStripeEventContext(null, req.body);
+    await sendStripeWebhookAlert({
+      eventType: context.eventType,
+      sessionId: context.sessionId,
+      errorMessage: error.message || String(error),
+    });
+    return res.status(400).send(`Webhook Error: ${error.message}`);
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      await upsertPaymentStatus({
+        sessionId: session.id,
+        email: session.customer_email || session.customer_details?.email || null,
+        paymentStatus: session.payment_status || session.status || null,
+        paymentIntent: session.payment_intent || null,
+        customerEmail: session.customer_details?.email || session.customer_email || null,
+      });
+      logger.info('stripe', 'Checkout session completed', {
+        sessionId: session.id,
+        paymentStatus: session.payment_status || session.status || '(unknown)',
+      });
+    } else {
+      logger.info('stripe', 'Webhook received (ignored type)', { type: event.type });
+    }
+
+    return res.json({ received: true });
+  } catch (error) {
+    logger.error('stripe', 'Webhook handling failed', {
+      message: error.message || error,
+      type: error?.type,
+      eventType: event?.type,
+    });
+    const context = extractStripeEventContext(event, req.body);
+    await sendStripeWebhookAlert({
+      eventType: context.eventType,
+      sessionId: context.sessionId,
+      errorMessage: error.message || String(error),
+    });
+    return res.status(500).send('Webhook handler error');
+  }
+});
+
+app.use((err, req, res, next) => {
+  logger.error('express', 'Unhandled application error', {
+    path: req.originalUrl,
+    method: req.method,
+    message: err?.message || err,
+    stack: err?.stack,
+  });
+  if (res.headersSent) {
+    return next(err);
+  }
+  return res.status(500).json({ error: 'Erreur interne.' });
 });
 
 // Serve the frontend for any other route (root or refresh)
@@ -643,5 +1042,5 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Server ready on http://localhost:${PORT}`);
+  logger.info('process', 'Server ready', { port: PORT });
 });
