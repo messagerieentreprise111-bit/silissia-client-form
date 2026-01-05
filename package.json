@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "outbox:replay": "node scripts/replayOutbox.js"
+    "outbox:replay": "node scripts/replayOutbox.js",
+    "outbox:requeue-dead": "node scripts/requeueDeadOutbox.js"
   },
   "engines": {
     "node": ">=18"
