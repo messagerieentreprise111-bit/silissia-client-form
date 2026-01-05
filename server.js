@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
-const fs = require('fs/promises');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
@@ -13,9 +12,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const FASTLY_API_TOKEN = process.env.FASTLY_API_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL || '';
-const SELECTIONS_PATH = path.join(__dirname, 'data', 'selections.json');
-const OUTBOX_PATH = path.join(__dirname, 'data', 'outbox.json');
-const COMPLETIONS_PATH = path.join(__dirname, 'data', 'completions.json');
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || '';
 const SMTP_HOST = process.env.SMTP_HOST;
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
@@ -33,7 +29,6 @@ const STRIPE_SETUP_PRICE_ID = process.env.STRIPE_SETUP_PRICE_ID || '';
 const STRIPE_SUBSCRIPTION_PRICE_ID = process.env.STRIPE_SUBSCRIPTION_PRICE_ID || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || '').trim();
-const LEGACY_JSON_FALLBACK = (process.env.LEGACY_JSON_FALLBACK || 'true') === 'true';
 const stripe = STRIPE_SECRET_KEY
   ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' })
   : null;
@@ -234,68 +229,6 @@ async function checkAvailability(domain) {
   };
 }
 
-async function writeJsonFile(filePath, data, label) {
-  try {
-    await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
-  } catch (error) {
-    logger.error('json-store', `${label} write failed`, {
-      filePath,
-      message: error.message || error,
-      code: error.code,
-    });
-    throw error;
-  }
-}
-
-async function ensureJsonFile(filePath, fallbackValue, label) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  try {
-    await fs.access(filePath);
-    return false;
-  } catch (error) {
-    await writeJsonFile(filePath, fallbackValue, label);
-    logger.warn('json-store', `${label} file missing, created default`, { filePath });
-    return true;
-  }
-}
-
-async function readJsonFile(filePath, fallbackValue, label) {
-  await ensureJsonFile(filePath, fallbackValue, label);
-  try {
-    const raw = await fs.readFile(filePath, 'utf8');
-    if (!raw.trim()) {
-      logger.warn('json-store', `${label} file empty, resetting`, { filePath });
-      await writeJsonFile(filePath, fallbackValue, label);
-      return fallbackValue;
-    }
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(fallbackValue) && Array.isArray(parsed)) {
-      return parsed;
-    }
-    if (!Array.isArray(fallbackValue) && parsed && typeof parsed === 'object') {
-      return parsed;
-    }
-    logger.warn('json-store', `${label} file has unexpected shape, resetting`, { filePath });
-    await writeJsonFile(filePath, fallbackValue, label);
-    return fallbackValue;
-  } catch (error) {
-    if (error instanceof SyntaxError) {
-      logger.warn('json-store', `${label} file invalid JSON, resetting`, {
-        filePath,
-        message: error.message || error,
-      });
-      await writeJsonFile(filePath, fallbackValue, label);
-      return fallbackValue;
-    }
-    logger.error('json-store', `${label} file access failed`, {
-      filePath,
-      message: error.message || error,
-      code: error.code,
-    });
-    throw error;
-  }
-}
-
 async function ensureDbSchema() {
   await dbQuery(
     `CREATE TABLE IF NOT EXISTS payments (
@@ -349,92 +282,35 @@ async function ensureDbSchema() {
       last_http_status INTEGER
     )`
   );
-}
 
-async function migrateLegacyCompletions() {
-  try {
-    const legacy = await readJsonFile(COMPLETIONS_PATH, {}, 'completions');
-    const entries = Object.entries(legacy || {});
-    if (!entries.length) return;
-    for (const [key, value] of entries) {
-      const record = value || {};
-      await dbQuery(
-        `INSERT INTO completions
-          (completion_key, completed, completed_at, meta, payment_status, payment_intent, customer_email, payment_updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (completion_key) DO UPDATE SET
-          completed = EXCLUDED.completed,
-          completed_at = EXCLUDED.completed_at,
-          meta = EXCLUDED.meta,
-          payment_status = EXCLUDED.payment_status,
-          payment_intent = EXCLUDED.payment_intent,
-          customer_email = EXCLUDED.customer_email,
-          payment_updated_at = EXCLUDED.payment_updated_at,
-          updated_at = NOW()`,
-        [
-          key,
-          Boolean(record.completed),
-          record.completedAt || null,
-          record.meta || null,
-          record.paymentStatus || null,
-          record.paymentIntent || null,
-          record.customerEmail || null,
-          record.paymentUpdatedAt || null,
-        ]
-      );
-    }
-    logger.info('db', 'Legacy completions migrated', { count: entries.length });
-  } catch (error) {
-    logger.warn('db', 'Legacy completions migration skipped', {
-      message: error.message || error,
-    });
-  }
-}
-
-async function migrateLegacyOutbox() {
-  try {
-    const legacy = await readJsonFile(OUTBOX_PATH, [], 'outbox');
-    if (!Array.isArray(legacy) || !legacy.length) return;
-    for (const entry of legacy) {
-      await dbQuery(
-        `INSERT INTO outbox
-          (submission_id, payload, sheet_status, last_error, attempt_count, next_retry_at, created_at, updated_at, last_attempt_at, last_http_status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (submission_id) DO UPDATE SET
-          payload = EXCLUDED.payload,
-          sheet_status = EXCLUDED.sheet_status,
-          last_error = EXCLUDED.last_error,
-          attempt_count = EXCLUDED.attempt_count,
-          next_retry_at = EXCLUDED.next_retry_at,
-          updated_at = NOW(),
-          last_attempt_at = EXCLUDED.last_attempt_at,
-          last_http_status = EXCLUDED.last_http_status`,
-        [
-          entry.submissionId,
-          entry.payload || {},
-          entry.sheetStatus || 'pending',
-          entry.lastError || null,
-          entry.attemptCount || 0,
-          entry.nextRetryAt || null,
-          entry.createdAt || new Date().toISOString(),
-          entry.updatedAt || new Date().toISOString(),
-          entry.lastAttemptAt || null,
-          entry.lastHttpStatus || null,
-        ]
-      );
-    }
-    logger.info('db', 'Legacy outbox migrated', { count: legacy.length });
-  } catch (error) {
-    logger.warn('db', 'Legacy outbox migration skipped', {
-      message: error.message || error,
-    });
-  }
+  await dbQuery(
+    `CREATE TABLE IF NOT EXISTS selections (
+      submission_id TEXT PRIMARY KEY,
+      domain TEXT NOT NULL,
+      requested_domain TEXT,
+      local_part TEXT NOT NULL,
+      client_email TEXT,
+      chosen_at TIMESTAMPTZ NOT NULL,
+      has_existing_domain TEXT,
+      display_name TEXT,
+      comment TEXT,
+      full_name TEXT,
+      company TEXT,
+      session_id TEXT,
+      sheet_status TEXT,
+      last_error TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_retry_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`
+  );
 }
 
 async function initDb() {
   if (!DATABASE_URL) {
-    logger.warn('db', 'DATABASE_URL missing, using JSON storage');
-    return;
+    logger.error('db', 'DATABASE_URL missing, aborting startup');
+    throw new Error('DATABASE_URL missing');
   }
 
   dbPool = new Pool({
@@ -447,50 +323,21 @@ async function initDb() {
     await ensureDbSchema();
     dbReady = true;
     logger.info('db', 'DB connected', { url: redactDbUrl(DATABASE_URL) });
-    if (LEGACY_JSON_FALLBACK) {
-      await migrateLegacyCompletions();
-      await migrateLegacyOutbox();
-    }
   } catch (error) {
     dbReady = false;
-    logger.error('db', 'DB connection failed, falling back to JSON', {
+    logger.error('db', 'DB connection failed, aborting startup', {
       message: error.message || error,
     });
+    throw error;
   }
-}
-
-async function readSelections() {
-  return readJsonFile(SELECTIONS_PATH, [], 'selections');
 }
 
 async function readOutbox() {
   if (!dbReady) {
-    return readJsonFile(OUTBOX_PATH, [], 'outbox');
+    throw new Error('DB not ready');
   }
   const result = await dbQuery('SELECT * FROM outbox ORDER BY created_at ASC');
   return result.rows.map(mapOutboxRow);
-}
-
-async function readCompletions() {
-  if (!dbReady) {
-    return readJsonFile(COMPLETIONS_PATH, {}, 'completions');
-  }
-  const result = await dbQuery('SELECT * FROM completions');
-  const store = {};
-  result.rows.forEach((row) => {
-    store[row.completion_key] = {
-      completed: row.completed,
-      completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : null,
-      meta: row.meta || {},
-      paymentStatus: row.payment_status || null,
-      paymentIntent: row.payment_intent || null,
-      customerEmail: row.customer_email || null,
-      paymentUpdatedAt: row.payment_updated_at
-        ? new Date(row.payment_updated_at).toISOString()
-        : null,
-    };
-  });
-  return store;
 }
 
 function mapOutboxRow(row) {
@@ -584,71 +431,58 @@ function getNextRetryDelayMs(attemptCount) {
 
 async function updateSelectionStatusBySubmissionId(submissionId, patch) {
   if (!submissionId) return;
-  const selections = await readSelections();
-  const index = selections.findIndex((entry) => entry.submissionId === submissionId);
-  if (index === -1) return;
-  selections[index] = { ...selections[index], ...patch };
-  await writeJsonFile(SELECTIONS_PATH, selections, 'selections');
+  if (!dbReady) {
+    throw new Error('DB not ready');
+  }
+  await dbQuery(
+    `UPDATE selections SET
+      sheet_status = COALESCE($2, sheet_status),
+      last_error = $3,
+      attempt_count = COALESCE($4, attempt_count),
+      next_retry_at = $5,
+      updated_at = NOW()
+     WHERE submission_id = $1`,
+    [
+      submissionId,
+      patch.sheetStatus || null,
+      patch.lastError || null,
+      typeof patch.attemptCount === 'number' ? patch.attemptCount : null,
+      patch.nextRetryAt || null,
+    ]
+  );
 }
 
 async function updateOutboxEntry(submissionId, patch) {
   return withOutboxLock(async () => {
-    if (dbReady) {
-      const result = await dbQuery(
-        `UPDATE outbox SET
-          payload = COALESCE($2, payload),
-          sheet_status = COALESCE($3, sheet_status),
-          last_error = $4,
-          attempt_count = COALESCE($5, attempt_count),
-          next_retry_at = $6,
-          updated_at = NOW(),
-          last_attempt_at = $7,
-          last_http_status = $8
-         WHERE submission_id = $1
-         RETURNING *`,
-        [
-          submissionId,
-          patch.payload || null,
-          patch.sheetStatus || null,
-          patch.lastError || null,
-          typeof patch.attemptCount === 'number' ? patch.attemptCount : null,
-          patch.nextRetryAt || null,
-          patch.lastAttemptAt || null,
-          patch.lastHttpStatus || null,
-        ]
-      );
-      const row = result.rows[0];
-      if (!row) return null;
-      const updated = mapOutboxRow(row);
-      await updateSelectionStatusBySubmissionId(submissionId, {
-        sheetStatus: updated.sheetStatus,
-        lastError: updated.lastError,
-        attemptCount: updated.attemptCount,
-        nextRetryAt: updated.nextRetryAt,
-      });
-      if (LEGACY_JSON_FALLBACK) {
-        const outbox = await readJsonFile(OUTBOX_PATH, [], 'outbox');
-        const index = outbox.findIndex((entry) => entry.submissionId === submissionId);
-        if (index !== -1) {
-          outbox[index] = { ...outbox[index], ...updated, updatedAt: updated.updatedAt };
-        } else {
-          outbox.push(updated);
-        }
-        await writeJsonFile(OUTBOX_PATH, outbox, 'outbox');
-      }
-      return updated;
+    if (!dbReady) {
+      throw new Error('DB not ready');
     }
-
-    const outbox = await readOutbox();
-    const index = outbox.findIndex((entry) => entry.submissionId === submissionId);
-    if (index === -1) return null;
-    const updated = {
-      ...outbox[index],
-      ...patch,
-      updatedAt: new Date().toISOString(),
-    };
-    outbox[index] = updated;
-    await writeJsonFile(OUTBOX_PATH, outbox, 'outbox');
+    const result = await dbQuery(
+      `UPDATE outbox SET
+        payload = COALESCE($2, payload),
+        sheet_status = COALESCE($3, sheet_status),
+        last_error = $4,
+        attempt_count = COALESCE($5, attempt_count),
+        next_retry_at = $6,
+        updated_at = NOW(),
+        last_attempt_at = $7,
+        last_http_status = $8
+       WHERE submission_id = $1
+       RETURNING *`,
+      [
+        submissionId,
+        patch.payload || null,
+        patch.sheetStatus || null,
+        patch.lastError || null,
+        typeof patch.attemptCount === 'number' ? patch.attemptCount : null,
+        patch.nextRetryAt || null,
+        patch.lastAttemptAt || null,
+        patch.lastHttpStatus || null,
+      ]
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    const updated = mapOutboxRow(row);
     await updateSelectionStatusBySubmissionId(submissionId, {
       sheetStatus: updated.sheetStatus,
       lastError: updated.lastError,
@@ -661,53 +495,38 @@ async function updateOutboxEntry(submissionId, patch) {
 
 async function addOutboxEntry(entry) {
   return withOutboxLock(async () => {
-    if (dbReady) {
-      await dbQuery(
-        `INSERT INTO outbox
-          (submission_id, payload, sheet_status, last_error, attempt_count, next_retry_at, created_at, updated_at, last_attempt_at, last_http_status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (submission_id) DO NOTHING`,
-        [
-          entry.submissionId,
-          entry.payload || {},
-          entry.sheetStatus || 'pending',
-          entry.lastError || null,
-          entry.attemptCount || 0,
-          entry.nextRetryAt || null,
-          entry.createdAt || new Date().toISOString(),
-          entry.updatedAt || new Date().toISOString(),
-          entry.lastAttemptAt || null,
-          entry.lastHttpStatus || null,
-        ]
-      );
-      if (LEGACY_JSON_FALLBACK) {
-        const outbox = await readJsonFile(OUTBOX_PATH, [], 'outbox');
-        if (!outbox.some((item) => item.submissionId === entry.submissionId)) {
-          outbox.push(entry);
-          await writeJsonFile(OUTBOX_PATH, outbox, 'outbox');
-        }
-      }
-      return entry;
+    if (!dbReady) {
+      throw new Error('DB not ready');
     }
-
-    const outbox = await readOutbox();
-    if (outbox.some((item) => item.submissionId === entry.submissionId)) {
-      return entry;
-    }
-    outbox.push(entry);
-    await writeJsonFile(OUTBOX_PATH, outbox, 'outbox');
+    await dbQuery(
+      `INSERT INTO outbox
+        (submission_id, payload, sheet_status, last_error, attempt_count, next_retry_at, created_at, updated_at, last_attempt_at, last_http_status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (submission_id) DO NOTHING`,
+      [
+        entry.submissionId,
+        entry.payload || {},
+        entry.sheetStatus || 'pending',
+        entry.lastError || null,
+        entry.attemptCount || 0,
+        entry.nextRetryAt || null,
+        entry.createdAt || new Date().toISOString(),
+        entry.updatedAt || new Date().toISOString(),
+        entry.lastAttemptAt || null,
+        entry.lastHttpStatus || null,
+      ]
+    );
     return entry;
   });
 }
 
 async function getOutboxEntry(submissionId) {
-  if (dbReady) {
-    const result = await dbQuery('SELECT * FROM outbox WHERE submission_id = $1', [submissionId]);
-    const row = result.rows[0];
-    return row ? mapOutboxRow(row) : null;
+  if (!dbReady) {
+    throw new Error('DB not ready');
   }
-  const outbox = await readOutbox();
-  return outbox.find((entry) => entry.submissionId === submissionId) || null;
+  const result = await dbQuery('SELECT * FROM outbox WHERE submission_id = $1', [submissionId]);
+  const row = result.rows[0];
+  return row ? mapOutboxRow(row) : null;
 }
 
 async function attemptOutboxSend(submissionId, reason = 'auto') {
@@ -1262,37 +1081,22 @@ async function upsertPaymentStatus({ sessionId, email, paymentStatus, paymentInt
     paymentUpdatedAt: new Date().toISOString(),
   };
 
-  if (dbReady) {
-    for (const key of keys) {
-      await dbQuery(
-        `INSERT INTO completions
-          (completion_key, payment_status, payment_intent, customer_email, payment_updated_at)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (completion_key) DO UPDATE SET
-          payment_status = EXCLUDED.payment_status,
-          payment_intent = EXCLUDED.payment_intent,
-          customer_email = EXCLUDED.customer_email,
-          payment_updated_at = EXCLUDED.payment_updated_at,
-          updated_at = NOW()`,
-        [key, patch.paymentStatus, patch.paymentIntent, patch.customerEmail, patch.paymentUpdatedAt]
-      );
-    }
-
-    if (LEGACY_JSON_FALLBACK) {
-      const store = await readJsonFile(COMPLETIONS_PATH, {}, 'completions');
-      for (const key of keys) {
-        const existing = store[key] || {};
-        store[key] = { ...existing, ...patch, meta: { ...(existing.meta || {}) } };
-      }
-      await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
-    }
-  } else {
-    const store = await readCompletions();
-    for (const key of keys) {
-      const existing = store[key] || {};
-      store[key] = { ...existing, ...patch, meta: { ...(existing.meta || {}) } };
-    }
-    await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
+  if (!dbReady) {
+    throw new Error('DB not ready');
+  }
+  for (const key of keys) {
+    await dbQuery(
+      `INSERT INTO completions
+        (completion_key, payment_status, payment_intent, customer_email, payment_updated_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (completion_key) DO UPDATE SET
+        payment_status = EXCLUDED.payment_status,
+        payment_intent = EXCLUDED.payment_intent,
+        customer_email = EXCLUDED.customer_email,
+        payment_updated_at = EXCLUDED.payment_updated_at,
+        updated_at = NOW()`,
+      [key, patch.paymentStatus, patch.paymentIntent, patch.customerEmail, patch.paymentUpdatedAt]
+    );
   }
 
   logger.info('selection', 'Stripe session status cached', {
@@ -1311,50 +1115,26 @@ async function markCompletion({ sessionId, email, meta = {} }) {
     meta,
   };
 
-  if (dbReady) {
-    for (const key of keys) {
-      const existing = await dbQuery(
-        'SELECT meta FROM completions WHERE completion_key = $1',
-        [key]
-      );
-      const existingMeta = existing.rows[0]?.meta || {};
-      const mergedMeta = { ...existingMeta, ...(entry.meta || {}) };
-      await dbQuery(
-        `INSERT INTO completions
-          (completion_key, completed, completed_at, meta)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (completion_key) DO UPDATE SET
-          completed = EXCLUDED.completed,
-          completed_at = EXCLUDED.completed_at,
-          meta = EXCLUDED.meta,
-          updated_at = NOW()`,
-        [key, entry.completed, entry.completedAt, mergedMeta]
-      );
-    }
-
-    if (LEGACY_JSON_FALLBACK) {
-      const store = await readJsonFile(COMPLETIONS_PATH, {}, 'completions');
-      for (const key of keys) {
-        const existing = store[key] || {};
-        store[key] = {
-          ...existing,
-          ...entry,
-          meta: { ...(existing.meta || {}), ...(entry.meta || {}) },
-        };
-      }
-      await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
-    }
-  } else {
-    const store = await readCompletions();
-    for (const key of keys) {
-      const existing = store[key] || {};
-      store[key] = {
-        ...existing,
-        ...entry,
-        meta: { ...(existing.meta || {}), ...(entry.meta || {}) },
-      };
-    }
-    await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
+  if (!dbReady) {
+    throw new Error('DB not ready');
+  }
+  for (const key of keys) {
+    const existing = await dbQuery('SELECT meta FROM completions WHERE completion_key = $1', [
+      key,
+    ]);
+    const existingMeta = existing.rows[0]?.meta || {};
+    const mergedMeta = { ...existingMeta, ...(entry.meta || {}) };
+    await dbQuery(
+      `INSERT INTO completions
+        (completion_key, completed, completed_at, meta)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (completion_key) DO UPDATE SET
+        completed = EXCLUDED.completed,
+        completed_at = EXCLUDED.completed_at,
+        meta = EXCLUDED.meta,
+        updated_at = NOW()`,
+      [key, entry.completed, entry.completedAt, mergedMeta]
+    );
   }
   logger.info('selection', 'Completion guard updated', {
     keys,
@@ -1366,34 +1146,18 @@ async function markCompletion({ sessionId, email, meta = {} }) {
 async function isCompleted({ sessionId, email }) {
   const keys = getCompletionKeys({ sessionId, email });
   if (!keys.length) return { completed: false, key: null };
-  if (dbReady) {
-    const result = await dbQuery(
-      'SELECT completion_key, completed FROM completions WHERE completion_key = ANY($1)',
-      [keys]
-    );
-    const hit = result.rows.find((row) => row.completed);
-    if (hit) {
-      return { completed: true, key: hit.completion_key };
-    }
-
-    if (LEGACY_JSON_FALLBACK) {
-      const store = await readJsonFile(COMPLETIONS_PATH, {}, 'completions');
-      const legacyHit = keys.find((key) => store[key]?.completed);
-      if (legacyHit) {
-        await markCompletion({
-          sessionId,
-          email,
-          meta: store[legacyHit]?.meta || {},
-        });
-        return { completed: true, key: legacyHit };
-      }
-    }
-    return { completed: false, key: null };
+  if (!dbReady) {
+    throw new Error('DB not ready');
   }
-
-  const store = await readCompletions();
-  const hit = keys.find((key) => store[key]?.completed);
-  return { completed: Boolean(hit), key: hit || null };
+  const result = await dbQuery(
+    'SELECT completion_key, completed FROM completions WHERE completion_key = ANY($1)',
+    [keys]
+  );
+  const hit = result.rows.find((row) => row.completed);
+  if (hit) {
+    return { completed: true, key: hit.completion_key };
+  }
+  return { completed: false, key: null };
 }
 
 async function getStripeSessionStatus(sessionId) {
@@ -1600,7 +1364,6 @@ app.post('/api/selection', async (req, res) => {
   }
 
   try {
-    const selections = await readSelections();
     const submissionId = generateSubmissionId(sessionId);
     const nowIso = new Date().toISOString();
     const record = {
@@ -1621,8 +1384,32 @@ app.post('/api/selection', async (req, res) => {
       attemptCount: 0,
       nextRetryAt: nowIso,
     };
-    selections.push(record);
-    await writeJsonFile(SELECTIONS_PATH, selections, 'selections');
+    if (!dbReady) {
+      throw new Error('DB not ready');
+    }
+    await dbQuery(
+      `INSERT INTO selections
+        (submission_id, domain, requested_domain, local_part, client_email, chosen_at, has_existing_domain, display_name, comment, full_name, company, session_id, sheet_status, last_error, attempt_count, next_retry_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+      [
+        record.submissionId,
+        record.domain,
+        record.requestedDomain,
+        record.localPart,
+        record.clientEmail,
+        record.chosenAt,
+        record.hasExistingDomain,
+        record.displayName,
+        record.comment,
+        record.fullName,
+        record.company,
+        record.sessionId,
+        record.sheetStatus,
+        record.lastError,
+        record.attemptCount,
+        record.nextRetryAt,
+      ]
+    );
     logger.info('selection', 'Selection stored', {
       chosenDomain: normalizedChosen,
       sessionId: sessionId || '(none)',
@@ -1867,4 +1654,5 @@ async function startServer() {
 
 startServer().catch((error) => {
   logger.error('process', 'Startup failed', { message: error.message || error });
+  process.exit(1);
 });
