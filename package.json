@@ -4,7 +4,8 @@
   "description": "Post-payment form (Express + static HTML) ready for Render",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "outbox:replay": "node scripts/replayOutbox.js"
   },
   "engines": {
     "node": ">=18"
