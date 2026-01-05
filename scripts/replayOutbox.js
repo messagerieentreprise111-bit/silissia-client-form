@@ -372,6 +372,7 @@ async function main() {
     );
 
     if (ALERT_TEST) {
+      const runStart = Date.now();
       await sendAlertEmail({
         pendingCount: 0,
         oldestPendingAgeSec: 0,
@@ -379,7 +380,7 @@ async function main() {
         batchPickedCount: 0,
         sentCount: 0,
         retryCount: 0,
-        durationMs: 0,
+        durationMs: Date.now() - runStart,
         isTest: true,
       });
       console.log('Alert test email sent.');
