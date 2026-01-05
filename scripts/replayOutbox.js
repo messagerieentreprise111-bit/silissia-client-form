@@ -9,6 +9,7 @@ const OUTBOX_MAX_ATTEMPTS = parseInt(process.env.OUTBOX_MAX_ATTEMPTS || '5', 10)
 const DATABASE_SSL = process.env.DATABASE_SSL || '';
 const OUTBOX_MONITOR_ONLY = process.env.OUTBOX_MONITOR_ONLY === 'true';
 const ALERT_TEST = process.env.ALERT_TEST === 'true';
+const STRIPE_ALERT_TEST = process.env.STRIPE_ALERT_TEST === 'true';
 const ALERT_COOLDOWN_MINUTES = parseInt(process.env.ALERT_COOLDOWN_MINUTES || '30', 10);
 const ALERT_TO = (process.env.ALERT_TO || process.env.NOTIFY_TO || '').trim();
 const ALERT_FROM = (process.env.ALERT_FROM || process.env.SMTP_FROM || process.env.SMTP_USER || '').trim();
@@ -19,6 +20,20 @@ const SMTP_USER = process.env.SMTP_USER || '';
 const SMTP_PASS = process.env.SMTP_PASS || '';
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').trim();
 const SERVICE_NAME = (process.env.RENDER_SERVICE_NAME || 'outbox-replay').trim();
+const STRIPE_WEBHOOK_MONITOR_WINDOW_MINUTES = parseInt(
+  process.env.STRIPE_WEBHOOK_MONITOR_WINDOW_MINUTES || '10',
+  10
+);
+const STRIPE_WEBHOOK_ERROR_THRESHOLD = parseInt(
+  process.env.STRIPE_WEBHOOK_ERROR_THRESHOLD || '1',
+  10
+);
+const STRIPE_WINDOW_MINUTES = Number.isFinite(STRIPE_WEBHOOK_MONITOR_WINDOW_MINUTES)
+  ? STRIPE_WEBHOOK_MONITOR_WINDOW_MINUTES
+  : 10;
+const STRIPE_ERROR_THRESHOLD = Number.isFinite(STRIPE_WEBHOOK_ERROR_THRESHOLD)
+  ? STRIPE_WEBHOOK_ERROR_THRESHOLD
+  : 1;
 
 function getDbSslConfig() {
   if (DATABASE_SSL === 'true') {
@@ -193,6 +208,61 @@ async function sendAlertEmail({
   await sendWithSmtp({ subject, text });
 }
 
+async function sendStripeAlertEmail({ errorCount, windowMinutes, examples, isTest = false }) {
+  if (!ALERT_TO) {
+    console.error('Stripe alert skipped: ALERT_TO missing.');
+    return;
+  }
+  if (!ALERT_FROM) {
+    console.error('Stripe alert skipped: ALERT_FROM missing.');
+    return;
+  }
+  const subject = isTest
+    ? '[TEST] Stripe webhook monitoring'
+    : '[ALERTE] Stripe webhook errors detectees';
+  const lines = [];
+  if (isTest) {
+    lines.push("TEST MODE (STRIPE_ALERT_TEST=true) -- ceci n'est pas une vraie alerte");
+  }
+  lines.push(`service: ${SERVICE_NAME}`);
+  lines.push(`timestamp: ${new Date().toISOString()}`);
+  lines.push(`error_count: ${errorCount}`);
+  lines.push(`window_minutes: ${windowMinutes}`);
+  if (PUBLIC_BASE_URL) {
+    lines.push(`url: ${PUBLIC_BASE_URL}`);
+  }
+  lines.push('');
+  lines.push('exemples_recents:');
+  if (!examples.length) {
+    lines.push('- (aucun exemple disponible)');
+  } else {
+    for (const example of examples) {
+      lines.push(
+        `- event_id=${example.event_id || '(none)'} type=${example.type || '(none)'} status=${
+          example.status || '(none)'
+        } http_status=${example.http_status ?? '(none)'} error_message=${
+          example.error_message || '(none)'
+        }`
+      );
+    }
+  }
+  lines.push('');
+  lines.push('QUE FAIRE:');
+  lines.push('- Ouvrir Render -> service web "silissia-client-form" -> Logs : chercher erreurs /webhook/stripe.');
+  lines.push('- Verifier STRIPE_WEBHOOK_SECRET et STRIPE_SECRET_KEY.');
+  lines.push('- Verifier que le webhook Stripe pointe sur la bonne URL (prod vs test).');
+  lines.push('- Verifier dans Stripe Dashboard -> Developers -> Webhooks les retries/checs.');
+  lines.push('- Si invalid_signature : probleme de secret ou mauvais endpoint.');
+  lines.push('- Si 5xx : bug serveur/DB down a traiter en priorite haute.');
+
+  const text = lines.join('\n');
+  if (SENDGRID_API_KEY) {
+    await sendWithSendGrid({ subject, text });
+    return;
+  }
+  await sendWithSmtp({ subject, text });
+}
+
 async function postWithTimeout(url, payload, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -290,6 +360,24 @@ async function setAlertSent(pool) {
   );
 }
 
+async function shouldSendStripeAlert(pool) {
+  const result = await pool.query(
+    `SELECT last_alert_at FROM monitor_state WHERE key = 'stripe_webhook_alert_last_sent'`
+  );
+  const lastAlertAt = result.rows[0]?.last_alert_at;
+  if (!lastAlertAt) return true;
+  const elapsedMs = Date.now() - new Date(lastAlertAt).getTime();
+  return elapsedMs >= ALERT_COOLDOWN_MINUTES * 60 * 1000;
+}
+
+async function setStripeAlertSent(pool) {
+  await pool.query(
+    `INSERT INTO monitor_state (key, last_alert_at)
+     VALUES ('stripe_webhook_alert_last_sent', NOW())
+     ON CONFLICT (key) DO UPDATE SET last_alert_at = NOW()`
+  );
+}
+
 function logRunSummary(summary) {
   const payload = {
     level: 'info',
@@ -351,7 +439,7 @@ async function main() {
     console.error('DATABASE_URL missing. Aborting replay.');
     process.exit(1);
   }
-  if (!OUTBOX_MONITOR_ONLY && !APPS_SCRIPT_WEBHOOK) {
+  if (!STRIPE_ALERT_TEST && !OUTBOX_MONITOR_ONLY && !APPS_SCRIPT_WEBHOOK) {
     console.error('APPS_SCRIPT_WEBHOOK missing. Aborting replay.');
     process.exit(1);
   }
@@ -370,6 +458,25 @@ async function main() {
         last_alert_at TIMESTAMPTZ
       )`
     );
+
+    if (STRIPE_ALERT_TEST) {
+      await sendStripeAlertEmail({
+        errorCount: STRIPE_ERROR_THRESHOLD,
+        windowMinutes: STRIPE_WINDOW_MINUTES,
+        examples: [
+          {
+            event_id: 'evt_test_stripe_alert',
+            type: 'checkout.session.completed',
+            status: 'error',
+            http_status: 500,
+            error_message: 'TEST MODE',
+          },
+        ],
+        isTest: true,
+      });
+      console.log('Stripe alert test email sent.');
+      return;
+    }
 
     if (ALERT_TEST) {
       const runStart = Date.now();
@@ -460,6 +567,33 @@ async function main() {
       });
       await setAlertSent(pool);
       console.log('Alert email sent.');
+    }
+
+    const stripeErrorResult = await pool.query(
+      `SELECT COUNT(*)::int AS error_count
+       FROM stripe_events
+       WHERE received_at >= NOW() - ($1::int * INTERVAL '1 minute')
+         AND (status IN ('error','invalid_signature') OR http_status >= 400)`,
+      [STRIPE_WINDOW_MINUTES]
+    );
+    const stripeErrorCount = stripeErrorResult.rows[0]?.error_count || 0;
+    if (stripeErrorCount >= STRIPE_ERROR_THRESHOLD && (await shouldSendStripeAlert(pool))) {
+      const stripeExamples = await pool.query(
+        `SELECT event_id, type, status, http_status, error_message
+         FROM stripe_events
+         WHERE received_at >= NOW() - ($1::int * INTERVAL '1 minute')
+           AND (status IN ('error','invalid_signature') OR http_status >= 400)
+         ORDER BY received_at DESC NULLS LAST
+         LIMIT 3`,
+        [STRIPE_WINDOW_MINUTES]
+      );
+      await sendStripeAlertEmail({
+        errorCount: stripeErrorCount,
+        windowMinutes: STRIPE_WINDOW_MINUTES,
+        examples: stripeExamples.rows || [],
+      });
+      await setStripeAlertSent(pool);
+      console.log('Stripe webhook alert email sent.');
     }
   } catch (error) {
     console.error(`Replay failed: ${error.message || error}`);

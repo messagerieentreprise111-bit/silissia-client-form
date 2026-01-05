@@ -247,11 +247,23 @@ async function ensureDbSchema() {
   await dbQuery(
     `CREATE TABLE IF NOT EXISTS stripe_events (
       event_id TEXT PRIMARY KEY,
-      type TEXT NOT NULL,
+      type TEXT,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created TIMESTAMPTZ,
+      status TEXT,
+      http_status INTEGER,
+      error_message TEXT,
       session_id TEXT,
+      customer_email TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`
   );
+  await dbQuery(`ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ`);
+  await dbQuery(`ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS created TIMESTAMPTZ`);
+  await dbQuery(`ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS status TEXT`);
+  await dbQuery(`ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS http_status INTEGER`);
+  await dbQuery(`ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS error_message TEXT`);
+  await dbQuery(`ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS customer_email TEXT`);
 
   await dbQuery(
     `CREATE TABLE IF NOT EXISTS completions (
@@ -846,6 +858,136 @@ function extractStripeEventContext(event, rawBody) {
   }
 }
 
+function normalizeStripeTimestamp(value) {
+  if (!value) return null;
+  if (typeof value === 'number') {
+    return new Date(value * 1000).toISOString();
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString();
+}
+
+function getStripeDataObjectContext(dataObject) {
+  if (!dataObject || typeof dataObject !== 'object') {
+    return { sessionId: null, customerEmail: null };
+  }
+  return {
+    sessionId:
+      dataObject.id ||
+      dataObject.session_id ||
+      dataObject.client_reference_id ||
+      dataObject.metadata?.session_id ||
+      null,
+    customerEmail:
+      dataObject.customer_details?.email ||
+      dataObject.customer_email ||
+      dataObject.receipt_email ||
+      null,
+  };
+}
+
+function parseStripeRawBody(rawBody) {
+  if (!rawBody) return null;
+  try {
+    const jsonString =
+      typeof rawBody === 'string' ? rawBody : rawBody?.toString ? rawBody.toString('utf8') : '';
+    return jsonString ? JSON.parse(jsonString) : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractStripeEventDetails(event, rawBody) {
+  if (event) {
+    const dataObject = event?.data?.object || {};
+    const { sessionId, customerEmail } = getStripeDataObjectContext(dataObject);
+    return {
+      eventId: event.id || null,
+      type: event.type || null,
+      created: normalizeStripeTimestamp(event.created),
+      sessionId,
+      customerEmail,
+    };
+  }
+
+  const parsed = parseStripeRawBody(rawBody);
+  const dataObject = parsed?.data?.object || {};
+  const { sessionId, customerEmail } = getStripeDataObjectContext(dataObject);
+  return {
+    eventId: parsed?.id || null,
+    type: parsed?.type || null,
+    created: normalizeStripeTimestamp(parsed?.created),
+    sessionId,
+    customerEmail,
+  };
+}
+
+function truncateErrorMessage(message, maxLength = 500) {
+  if (!message) return null;
+  const text = String(message);
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+function generateStripeEventIdFallback() {
+  if (typeof crypto.randomUUID === 'function') {
+    return `invalid-${crypto.randomUUID()}`;
+  }
+  return `invalid-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function insertStripeEvent({
+  eventId,
+  type,
+  created,
+  sessionId,
+  customerEmail,
+  status,
+  httpStatus,
+  errorMessage,
+}) {
+  if (!dbReady) {
+    return { inserted: true, eventId: eventId || null };
+  }
+  const resolvedId = eventId || generateStripeEventIdFallback();
+  const result = await dbQuery(
+    `INSERT INTO stripe_events
+      (event_id, type, received_at, created, status, http_status, error_message, session_id, customer_email)
+     VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (event_id) DO NOTHING`,
+    [
+      resolvedId,
+      type || null,
+      created || null,
+      status || null,
+      typeof httpStatus === 'number' ? httpStatus : null,
+      truncateErrorMessage(errorMessage),
+      sessionId || null,
+      customerEmail || null,
+    ]
+  );
+  return { inserted: result.rowCount === 1, eventId: resolvedId };
+}
+
+async function updateStripeEventStatus({ eventId, status, httpStatus, errorMessage }) {
+  if (!dbReady || !eventId) return;
+  await dbQuery(
+    `UPDATE stripe_events
+     SET status = $2,
+         http_status = $3,
+         error_message = $4,
+         received_at = NOW()
+     WHERE event_id = $1`,
+    [
+      eventId,
+      status || null,
+      typeof httpStatus === 'number' ? httpStatus : null,
+      truncateErrorMessage(errorMessage),
+    ]
+  );
+}
+
 async function enqueueOutbox(payload, submissionId) {
   const nowIso = new Date().toISOString();
   const entry = {
@@ -1037,17 +1179,12 @@ async function upsertPaymentRecord({
 }
 
 async function recordStripeEvent(event) {
-  if (!dbReady || !event?.id) {
-    return { inserted: true };
-  }
-  const sessionId = event?.data?.object?.id || event?.data?.object?.session_id || null;
-  const result = await dbQuery(
-    `INSERT INTO stripe_events (event_id, type, session_id)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (event_id) DO NOTHING`,
-    [event.id, event.type, sessionId]
-  );
-  return { inserted: result.rowCount === 1 };
+  const details = extractStripeEventDetails(event, null);
+  return insertStripeEvent({
+    ...details,
+    status: 'processed',
+    httpStatus: 200,
+  });
 }
 
 function hasAccessContext({ sessionId, email }) {
@@ -1527,25 +1664,36 @@ app.post('/webhook/stripe', async (req, res) => {
       message: error.message || error,
       type: error?.type,
     });
-    const context = extractStripeEventContext(null, req.body);
-    await sendStripeWebhookAlert({
-      eventType: context.eventType,
-      sessionId: context.sessionId,
+    const details = extractStripeEventDetails(null, req.body);
+    await insertStripeEvent({
+      ...details,
+      status: 'invalid_signature',
+      httpStatus: 400,
       errorMessage: error.message || String(error),
     });
     return res.status(400).send(`Webhook Error: ${error.message}`);
   }
 
-  try {
-    const recorded = await recordStripeEvent(event);
-    if (!recorded.inserted) {
-      logger.info('stripe', 'Webhook duplicate ignored', {
-        eventId: event.id,
-        type: event.type,
-      });
-      return res.json({ received: true, duplicate: true });
-    }
+  const details = extractStripeEventDetails(event, null);
+  const recorded = await insertStripeEvent({
+    ...details,
+    status: 'processed',
+    httpStatus: 200,
+  });
+  if (!recorded.inserted) {
+    await updateStripeEventStatus({
+      eventId: recorded.eventId,
+      status: 'duplicate',
+      httpStatus: 200,
+    });
+    logger.info('stripe', 'Webhook duplicate ignored', {
+      eventId: event.id,
+      type: event.type,
+    });
+    return res.json({ received: true, duplicate: true });
+  }
 
+  try {
     if (
       event.type === 'checkout.session.completed' ||
       event.type === 'checkout.session.async_payment_succeeded'
@@ -1603,10 +1751,10 @@ app.post('/webhook/stripe', async (req, res) => {
       type: error?.type,
       eventType: event?.type,
     });
-    const context = extractStripeEventContext(event, req.body);
-    await sendStripeWebhookAlert({
-      eventType: context.eventType,
-      sessionId: context.sessionId,
+    await updateStripeEventStatus({
+      eventId: recorded.eventId,
+      status: 'error',
+      httpStatus: 500,
       errorMessage: error.message || String(error),
     });
     return res.status(500).send('Webhook handler error');
