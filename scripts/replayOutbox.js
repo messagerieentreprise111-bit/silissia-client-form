@@ -121,6 +121,10 @@ async function sendAlertEmail({
   pendingCount,
   oldestPendingAgeSec,
   deadCount,
+  batchPickedCount = null,
+  sentCount = null,
+  retryCount = null,
+  durationMs = null,
   isTest = false,
 }) {
   if (!ALERT_TO) {
@@ -131,24 +135,56 @@ async function sendAlertEmail({
     console.error('Alert skipped: ALERT_FROM missing.');
     return;
   }
+  const alertType = deadCount > 0 ? 'dead' : 'pending';
   const subject = isTest
     ? '[TEST] Outbox monitoring'
-    : deadCount > 0
+    : alertType === 'dead'
     ? '[ALERTE] Outbox dead detecte'
     : '[ALERTE] Outbox pending accumule';
   const lines = [];
   if (isTest) {
-    lines.push('TEST MODE (ALERT_TEST=true)');
-    lines.push("Ceci n'est pas une alerte reelle.");
+    lines.push("TEST MODE (ALERT_TEST=true) -- ceci n'est pas une vraie alerte");
   }
   lines.push(`service: ${SERVICE_NAME}`);
   lines.push(`timestamp: ${new Date().toISOString()}`);
   lines.push(`pending_count: ${pendingCount}`);
   lines.push(`oldest_pending_age_sec: ${oldestPendingAgeSec}`);
   lines.push(`dead_count: ${deadCount}`);
+  if (batchPickedCount !== null) {
+    lines.push(`batch_picked_count: ${batchPickedCount}`);
+  }
+  if (sentCount !== null) {
+    lines.push(`sent_count: ${sentCount}`);
+  }
+  if (retryCount !== null) {
+    lines.push(`retry_count: ${retryCount}`);
+  }
+  if (durationMs !== null) {
+    lines.push(`duration_ms: ${durationMs}`);
+  }
   if (PUBLIC_BASE_URL) {
     lines.push(`url: ${PUBLIC_BASE_URL}`);
   }
+  lines.push('');
+  lines.push('QUE FAIRE:');
+  const actionLines = [];
+  const pendingTrigger = pendingCount > 5 || oldestPendingAgeSec > 600;
+  if (pendingTrigger || (isTest && deadCount === 0)) {
+    actionLines.push('- Ouvrir Render -> service "outbox-replay" -> Logs : verifier erreurs HTTP Apps Script.');
+    actionLines.push('- Verifier APPS_SCRIPT_WEBHOOK present et correct dans les env du cron job.');
+    actionLines.push('- Verifier Apps Script accessible (Web App active) et pas en erreur/rate-limit.');
+    actionLines.push(
+      '- Si ca persiste : augmenter APPS_SCRIPT_TIMEOUT_MS (ex 20000) ou reduire OUTBOX_BATCH_SIZE.'
+    );
+  }
+  if (deadCount > 0 || (isTest && !pendingTrigger)) {
+    actionLines.push('- Inspecter en DB les lignes outbox en status dead (last_error, attempts, payload).');
+    actionLines.push('- Corriger la cause (Apps Script down / payload invalide / auth).');
+    actionLines.push('- Prevoir une recuperation : remettre en pending ou script de requeue.');
+  }
+  actionLines.push('- Verifier variables email (SENDGRID_API_KEY ou SMTP_*).');
+  actionLines.push('- Verifier ALERT_COOLDOWN_MINUTES pour eviter le spam.');
+  lines.push(...actionLines);
   const text = lines.join('\n');
   if (SENDGRID_API_KEY) {
     await sendWithSendGrid({ subject, text });
@@ -340,6 +376,10 @@ async function main() {
         pendingCount: 0,
         oldestPendingAgeSec: 0,
         deadCount: 0,
+        batchPickedCount: 0,
+        sentCount: 0,
+        retryCount: 0,
+        durationMs: 0,
         isTest: true,
       });
       console.log('Alert test email sent.');
@@ -412,6 +452,10 @@ async function main() {
         pendingCount: afterMetrics.pendingCount,
         oldestPendingAgeSec: afterMetrics.oldestPendingAgeSec,
         deadCount: afterMetrics.deadCount,
+        batchPickedCount: batch.length,
+        sentCount,
+        retryCount,
+        durationMs,
       });
       await setAlertSent(pool);
       console.log('Alert email sent.');
