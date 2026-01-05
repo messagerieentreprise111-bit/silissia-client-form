@@ -2,15 +2,19 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const fs = require('fs/promises');
+const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 const Stripe = require('stripe');
+const { Pool } = require('pg');
 const logger = require('./logger');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const FASTLY_API_TOKEN = process.env.FASTLY_API_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL || '';
 const SELECTIONS_PATH = path.join(__dirname, 'data', 'selections.json');
+const OUTBOX_PATH = path.join(__dirname, 'data', 'outbox.json');
 const COMPLETIONS_PATH = path.join(__dirname, 'data', 'completions.json');
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || '';
 const SMTP_HOST = process.env.SMTP_HOST;
@@ -23,10 +27,13 @@ const DISABLE_COMPLETION_GUARD = process.env.DISABLE_COMPLETION_GUARD === 'true'
 const APPS_SCRIPT_WEBHOOK = process.env.APPS_SCRIPT_WEBHOOK || '';
 const NOTIFICATION_TIMEOUT_MS = 8000;
 const APPS_SCRIPT_TIMEOUT_MS = parseInt(process.env.APPS_SCRIPT_TIMEOUT_MS || '12000', 10);
+const OUTBOX_POLL_INTERVAL_MS = parseInt(process.env.OUTBOX_POLL_INTERVAL_MS || '60000', 10);
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_SETUP_PRICE_ID = process.env.STRIPE_SETUP_PRICE_ID || '';
 const STRIPE_SUBSCRIPTION_PRICE_ID = process.env.STRIPE_SUBSCRIPTION_PRICE_ID || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || '').trim();
+const LEGACY_JSON_FALLBACK = (process.env.LEGACY_JSON_FALLBACK || 'true') === 'true';
 const stripe = STRIPE_SECRET_KEY
   ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' })
   : null;
@@ -289,12 +296,225 @@ async function readJsonFile(filePath, fallbackValue, label) {
   }
 }
 
+async function ensureDbSchema() {
+  await dbQuery(
+    `CREATE TABLE IF NOT EXISTS payments (
+      session_id TEXT PRIMARY KEY,
+      paid BOOLEAN NOT NULL DEFAULT FALSE,
+      amount_total INTEGER,
+      currency TEXT,
+      customer_email TEXT,
+      source TEXT,
+      livemode BOOLEAN,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`
+  );
+
+  await dbQuery(
+    `CREATE TABLE IF NOT EXISTS stripe_events (
+      event_id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      session_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`
+  );
+
+  await dbQuery(
+    `CREATE TABLE IF NOT EXISTS completions (
+      completion_key TEXT PRIMARY KEY,
+      completed BOOLEAN NOT NULL DEFAULT FALSE,
+      completed_at TIMESTAMPTZ,
+      meta JSONB,
+      payment_status TEXT,
+      payment_intent TEXT,
+      customer_email TEXT,
+      payment_updated_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`
+  );
+
+  await dbQuery(
+    `CREATE TABLE IF NOT EXISTS outbox (
+      submission_id TEXT PRIMARY KEY,
+      payload JSONB NOT NULL,
+      sheet_status TEXT NOT NULL,
+      last_error TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_retry_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_attempt_at TIMESTAMPTZ,
+      last_http_status INTEGER
+    )`
+  );
+}
+
+async function migrateLegacyCompletions() {
+  try {
+    const legacy = await readJsonFile(COMPLETIONS_PATH, {}, 'completions');
+    const entries = Object.entries(legacy || {});
+    if (!entries.length) return;
+    for (const [key, value] of entries) {
+      const record = value || {};
+      await dbQuery(
+        `INSERT INTO completions
+          (completion_key, completed, completed_at, meta, payment_status, payment_intent, customer_email, payment_updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (completion_key) DO UPDATE SET
+          completed = EXCLUDED.completed,
+          completed_at = EXCLUDED.completed_at,
+          meta = EXCLUDED.meta,
+          payment_status = EXCLUDED.payment_status,
+          payment_intent = EXCLUDED.payment_intent,
+          customer_email = EXCLUDED.customer_email,
+          payment_updated_at = EXCLUDED.payment_updated_at,
+          updated_at = NOW()`,
+        [
+          key,
+          Boolean(record.completed),
+          record.completedAt || null,
+          record.meta || null,
+          record.paymentStatus || null,
+          record.paymentIntent || null,
+          record.customerEmail || null,
+          record.paymentUpdatedAt || null,
+        ]
+      );
+    }
+    logger.info('db', 'Legacy completions migrated', { count: entries.length });
+  } catch (error) {
+    logger.warn('db', 'Legacy completions migration skipped', {
+      message: error.message || error,
+    });
+  }
+}
+
+async function migrateLegacyOutbox() {
+  try {
+    const legacy = await readJsonFile(OUTBOX_PATH, [], 'outbox');
+    if (!Array.isArray(legacy) || !legacy.length) return;
+    for (const entry of legacy) {
+      await dbQuery(
+        `INSERT INTO outbox
+          (submission_id, payload, sheet_status, last_error, attempt_count, next_retry_at, created_at, updated_at, last_attempt_at, last_http_status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (submission_id) DO UPDATE SET
+          payload = EXCLUDED.payload,
+          sheet_status = EXCLUDED.sheet_status,
+          last_error = EXCLUDED.last_error,
+          attempt_count = EXCLUDED.attempt_count,
+          next_retry_at = EXCLUDED.next_retry_at,
+          updated_at = NOW(),
+          last_attempt_at = EXCLUDED.last_attempt_at,
+          last_http_status = EXCLUDED.last_http_status`,
+        [
+          entry.submissionId,
+          entry.payload || {},
+          entry.sheetStatus || 'pending',
+          entry.lastError || null,
+          entry.attemptCount || 0,
+          entry.nextRetryAt || null,
+          entry.createdAt || new Date().toISOString(),
+          entry.updatedAt || new Date().toISOString(),
+          entry.lastAttemptAt || null,
+          entry.lastHttpStatus || null,
+        ]
+      );
+    }
+    logger.info('db', 'Legacy outbox migrated', { count: legacy.length });
+  } catch (error) {
+    logger.warn('db', 'Legacy outbox migration skipped', {
+      message: error.message || error,
+    });
+  }
+}
+
+async function initDb() {
+  if (!DATABASE_URL) {
+    logger.warn('db', 'DATABASE_URL missing, using JSON storage');
+    return;
+  }
+
+  dbPool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: getDbSslConfig(),
+  });
+
+  try {
+    await dbPool.query('SELECT 1');
+    await ensureDbSchema();
+    dbReady = true;
+    logger.info('db', 'DB connected', { url: redactDbUrl(DATABASE_URL) });
+    if (LEGACY_JSON_FALLBACK) {
+      await migrateLegacyCompletions();
+      await migrateLegacyOutbox();
+    }
+  } catch (error) {
+    dbReady = false;
+    logger.error('db', 'DB connection failed, falling back to JSON', {
+      message: error.message || error,
+    });
+  }
+}
+
 async function readSelections() {
   return readJsonFile(SELECTIONS_PATH, [], 'selections');
 }
 
+async function readOutbox() {
+  if (!dbReady) {
+    return readJsonFile(OUTBOX_PATH, [], 'outbox');
+  }
+  const result = await dbQuery('SELECT * FROM outbox ORDER BY created_at ASC');
+  return result.rows.map(mapOutboxRow);
+}
+
 async function readCompletions() {
-  return readJsonFile(COMPLETIONS_PATH, {}, 'completions');
+  if (!dbReady) {
+    return readJsonFile(COMPLETIONS_PATH, {}, 'completions');
+  }
+  const result = await dbQuery('SELECT * FROM completions');
+  const store = {};
+  result.rows.forEach((row) => {
+    store[row.completion_key] = {
+      completed: row.completed,
+      completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : null,
+      meta: row.meta || {},
+      paymentStatus: row.payment_status || null,
+      paymentIntent: row.payment_intent || null,
+      customerEmail: row.customer_email || null,
+      paymentUpdatedAt: row.payment_updated_at
+        ? new Date(row.payment_updated_at).toISOString()
+        : null,
+    };
+  });
+  return store;
+}
+
+function mapOutboxRow(row) {
+  return {
+    submissionId: row.submission_id,
+    payload: row.payload || {},
+    sheetStatus: row.sheet_status,
+    lastError: row.last_error,
+    attemptCount: row.attempt_count,
+    nextRetryAt: row.next_retry_at ? new Date(row.next_retry_at).toISOString() : null,
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+    lastAttemptAt: row.last_attempt_at ? new Date(row.last_attempt_at).toISOString() : null,
+    lastHttpStatus: row.last_http_status,
+  };
+}
+
+let outboxLock = Promise.resolve();
+const outboxInFlight = new Set();
+
+function withOutboxLock(task) {
+  const next = outboxLock.then(task, task);
+  outboxLock = next.catch(() => {});
+  return next;
 }
 
 function withTimeout(promise, ms, label = 'Operation') {
@@ -305,6 +525,300 @@ function withTimeout(promise, ms, label = 'Operation') {
     }, ms);
   });
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+}
+
+let dbPool = null;
+let dbReady = false;
+
+function redactDbUrl(value) {
+  if (!value) return '(none)';
+  try {
+    const url = new URL(value);
+    if (url.password) url.password = '***';
+    return url.toString();
+  } catch {
+    return value.replace(/:[^:@]+@/, ':***@');
+  }
+}
+
+function getDbSslConfig() {
+  if (process.env.DATABASE_SSL === 'true') {
+    return { rejectUnauthorized: false };
+  }
+  try {
+    const url = new URL(DATABASE_URL);
+    const sslMode = url.searchParams.get('sslmode');
+    if (sslMode && sslMode !== 'disable') {
+      return { rejectUnauthorized: false };
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+async function dbQuery(text, params) {
+  if (!dbPool) {
+    throw new Error('DB pool not initialized');
+  }
+  return dbPool.query(text, params);
+}
+
+function generateSubmissionId(sessionId) {
+  const base = (sessionId || '').trim();
+  let randomPart;
+  if (typeof crypto.randomUUID === 'function') {
+    randomPart = crypto.randomUUID();
+  } else {
+    randomPart = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+  return base ? `${base}-${randomPart}` : randomPart;
+}
+
+function getNextRetryDelayMs(attemptCount) {
+  const minutesByAttempt = [1, 5, 15, 60, 360];
+  const index = Math.max(0, attemptCount - 1);
+  const minutes = minutesByAttempt[index] ?? minutesByAttempt[minutesByAttempt.length - 1];
+  return minutes * 60 * 1000;
+}
+
+async function updateSelectionStatusBySubmissionId(submissionId, patch) {
+  if (!submissionId) return;
+  const selections = await readSelections();
+  const index = selections.findIndex((entry) => entry.submissionId === submissionId);
+  if (index === -1) return;
+  selections[index] = { ...selections[index], ...patch };
+  await writeJsonFile(SELECTIONS_PATH, selections, 'selections');
+}
+
+async function updateOutboxEntry(submissionId, patch) {
+  return withOutboxLock(async () => {
+    if (dbReady) {
+      const result = await dbQuery(
+        `UPDATE outbox SET
+          payload = COALESCE($2, payload),
+          sheet_status = COALESCE($3, sheet_status),
+          last_error = $4,
+          attempt_count = COALESCE($5, attempt_count),
+          next_retry_at = $6,
+          updated_at = NOW(),
+          last_attempt_at = $7,
+          last_http_status = $8
+         WHERE submission_id = $1
+         RETURNING *`,
+        [
+          submissionId,
+          patch.payload || null,
+          patch.sheetStatus || null,
+          patch.lastError || null,
+          typeof patch.attemptCount === 'number' ? patch.attemptCount : null,
+          patch.nextRetryAt || null,
+          patch.lastAttemptAt || null,
+          patch.lastHttpStatus || null,
+        ]
+      );
+      const row = result.rows[0];
+      if (!row) return null;
+      const updated = mapOutboxRow(row);
+      await updateSelectionStatusBySubmissionId(submissionId, {
+        sheetStatus: updated.sheetStatus,
+        lastError: updated.lastError,
+        attemptCount: updated.attemptCount,
+        nextRetryAt: updated.nextRetryAt,
+      });
+      if (LEGACY_JSON_FALLBACK) {
+        const outbox = await readJsonFile(OUTBOX_PATH, [], 'outbox');
+        const index = outbox.findIndex((entry) => entry.submissionId === submissionId);
+        if (index !== -1) {
+          outbox[index] = { ...outbox[index], ...updated, updatedAt: updated.updatedAt };
+        } else {
+          outbox.push(updated);
+        }
+        await writeJsonFile(OUTBOX_PATH, outbox, 'outbox');
+      }
+      return updated;
+    }
+
+    const outbox = await readOutbox();
+    const index = outbox.findIndex((entry) => entry.submissionId === submissionId);
+    if (index === -1) return null;
+    const updated = {
+      ...outbox[index],
+      ...patch,
+      updatedAt: new Date().toISOString(),
+    };
+    outbox[index] = updated;
+    await writeJsonFile(OUTBOX_PATH, outbox, 'outbox');
+    await updateSelectionStatusBySubmissionId(submissionId, {
+      sheetStatus: updated.sheetStatus,
+      lastError: updated.lastError,
+      attemptCount: updated.attemptCount,
+      nextRetryAt: updated.nextRetryAt,
+    });
+    return updated;
+  });
+}
+
+async function addOutboxEntry(entry) {
+  return withOutboxLock(async () => {
+    if (dbReady) {
+      await dbQuery(
+        `INSERT INTO outbox
+          (submission_id, payload, sheet_status, last_error, attempt_count, next_retry_at, created_at, updated_at, last_attempt_at, last_http_status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (submission_id) DO NOTHING`,
+        [
+          entry.submissionId,
+          entry.payload || {},
+          entry.sheetStatus || 'pending',
+          entry.lastError || null,
+          entry.attemptCount || 0,
+          entry.nextRetryAt || null,
+          entry.createdAt || new Date().toISOString(),
+          entry.updatedAt || new Date().toISOString(),
+          entry.lastAttemptAt || null,
+          entry.lastHttpStatus || null,
+        ]
+      );
+      if (LEGACY_JSON_FALLBACK) {
+        const outbox = await readJsonFile(OUTBOX_PATH, [], 'outbox');
+        if (!outbox.some((item) => item.submissionId === entry.submissionId)) {
+          outbox.push(entry);
+          await writeJsonFile(OUTBOX_PATH, outbox, 'outbox');
+        }
+      }
+      return entry;
+    }
+
+    const outbox = await readOutbox();
+    if (outbox.some((item) => item.submissionId === entry.submissionId)) {
+      return entry;
+    }
+    outbox.push(entry);
+    await writeJsonFile(OUTBOX_PATH, outbox, 'outbox');
+    return entry;
+  });
+}
+
+async function getOutboxEntry(submissionId) {
+  if (dbReady) {
+    const result = await dbQuery('SELECT * FROM outbox WHERE submission_id = $1', [submissionId]);
+    const row = result.rows[0];
+    return row ? mapOutboxRow(row) : null;
+  }
+  const outbox = await readOutbox();
+  return outbox.find((entry) => entry.submissionId === submissionId) || null;
+}
+
+async function attemptOutboxSend(submissionId, reason = 'auto') {
+  if (!submissionId || outboxInFlight.has(submissionId)) return;
+  outboxInFlight.add(submissionId);
+  try {
+    const entry = await getOutboxEntry(submissionId);
+    if (!entry) return;
+    if (entry.sheetStatus === 'sent') return;
+    if (!APPS_SCRIPT_WEBHOOK) {
+      await updateOutboxEntry(submissionId, {
+        sheetStatus: 'failed',
+        lastError: 'Apps Script webhook not configured',
+        nextRetryAt: null,
+        lastAttemptAt: new Date().toISOString(),
+      });
+      logger.error('apps-script', 'Apps Script webhook missing, cannot send', {
+        submissionId,
+      });
+      return;
+    }
+
+    const attemptCount = (entry.attemptCount || 0) + 1;
+    const payload = { ...entry.payload, submissionId };
+    const attemptStartedAt = new Date().toISOString();
+
+    logger.info('apps-script', 'Apps Script webhook attempt', {
+      submissionId,
+      attemptCount,
+      reason,
+      timeoutMs: APPS_SCRIPT_TIMEOUT_MS,
+    });
+
+    let response;
+    let responseText = '';
+    try {
+      response = await withTimeout(
+        fetch(APPS_SCRIPT_WEBHOOK, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }),
+        APPS_SCRIPT_TIMEOUT_MS,
+        'Webhook call'
+      );
+      responseText = await response.text().catch(() => '');
+      if (!response.ok) {
+        throw new Error(
+          `Webhook responded with status ${response.status} ${response.statusText}: ${responseText || '(empty)'}`
+        );
+      }
+    } catch (error) {
+      const delayMs = getNextRetryDelayMs(attemptCount);
+      const nextRetryAt = new Date(Date.now() + delayMs).toISOString();
+      await updateOutboxEntry(submissionId, {
+        sheetStatus: 'pending',
+        attemptCount,
+        lastError: error.message || String(error),
+        nextRetryAt,
+        lastAttemptAt: attemptStartedAt,
+        lastHttpStatus: response?.status || null,
+      });
+      logger.error('apps-script', 'Apps Script webhook failed', {
+        submissionId,
+        attemptCount,
+        status: response?.status || null,
+        error: error.message || error,
+        nextRetryAt,
+      });
+      return;
+    }
+
+    await updateOutboxEntry(submissionId, {
+      sheetStatus: 'sent',
+      attemptCount,
+      lastError: null,
+      nextRetryAt: null,
+      lastAttemptAt: attemptStartedAt,
+      lastHttpStatus: response?.status || null,
+    });
+    logger.info('apps-script', 'Apps Script webhook success', {
+      submissionId,
+      attemptCount,
+      status: response?.status || null,
+      body: responseText || '(empty)',
+    });
+  } finally {
+    outboxInFlight.delete(submissionId);
+  }
+}
+
+let retryWorkerRunning = false;
+
+async function processDueOutbox() {
+  if (retryWorkerRunning) return;
+  retryWorkerRunning = true;
+  try {
+    const outbox = await readOutbox();
+    const now = Date.now();
+    const due = outbox.filter(
+      (entry) =>
+        entry.sheetStatus === 'pending' &&
+        entry.nextRetryAt &&
+        new Date(entry.nextRetryAt).getTime() <= now
+    );
+    for (const entry of due) {
+      await attemptOutboxSend(entry.submissionId, 'retry');
+    }
+  } finally {
+    retryWorkerRunning = false;
+  }
 }
 
 function buildNotificationContent({ domain, localPart, clientEmail }) {
@@ -513,50 +1027,22 @@ function extractStripeEventContext(event, rawBody) {
   }
 }
 
-async function forwardToWebhook(payload) {
-  if (!APPS_SCRIPT_WEBHOOK) return;
-  try {
-    logger.info('apps-script', 'Forwarding selection to Apps Script webhook', {
-      url: APPS_SCRIPT_WEBHOOK,
-      sessionId: payload?.sessionId || payload?.session_id || '(none)',
-      currentEmail: payload?.currentEmail || '(none)',
-      chosenDomain: payload?.chosenDomain || '(none)',
-      localPart: payload?.localPart || '(none)',
-      timeoutMs: APPS_SCRIPT_TIMEOUT_MS,
-    });
-    const response = await withTimeout(
-      fetch(APPS_SCRIPT_WEBHOOK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      }),
-      APPS_SCRIPT_TIMEOUT_MS,
-      'Webhook call'
-    );
-    const text = await response.text().catch(() => '');
-    if (!response.ok) {
-      logger.error('apps-script', 'Apps Script webhook failed', {
-        url: APPS_SCRIPT_WEBHOOK,
-        status: response.status,
-        statusText: response.statusText,
-        body: text || '(no body)',
-        payload,
-      });
-      throw new Error(`Webhook responded with status ${response.status}`);
-    }
-    logger.info('apps-script', 'Apps Script webhook success', {
-      status: response.status,
-      body: text || '(empty)',
-      payload,
-    });
-  } catch (error) {
-    logger.error('apps-script', 'Apps Script webhook failed (non-blocking)', {
-      url: APPS_SCRIPT_WEBHOOK || '(none)',
-      message: error.message || error,
-      name: error.name,
-      timeoutMs: APPS_SCRIPT_TIMEOUT_MS,
-    });
-  }
+async function enqueueOutbox(payload, submissionId) {
+  const nowIso = new Date().toISOString();
+  const entry = {
+    submissionId,
+    payload,
+    sheetStatus: 'pending',
+    lastError: null,
+    attemptCount: 0,
+    nextRetryAt: nowIso,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    lastAttemptAt: null,
+    lastHttpStatus: null,
+  };
+  await addOutboxEntry(entry);
+  attemptOutboxSend(submissionId, 'initial').catch(() => {});
 }
 
 app.get('/api/check', async (req, res) => {
@@ -646,14 +1132,129 @@ function getCompletionKeys({ sessionId, email }) {
   return keys;
 }
 
+function getExpectedStripeLivemode() {
+  if (!STRIPE_SECRET_KEY) return null;
+  if (STRIPE_SECRET_KEY.startsWith('sk_test_')) return false;
+  if (STRIPE_SECRET_KEY.startsWith('sk_live_')) return true;
+  return null;
+}
+
+function getExpectedPriceIds() {
+  return [STRIPE_SETUP_PRICE_ID, STRIPE_SUBSCRIPTION_PRICE_ID].filter(Boolean);
+}
+
+function validateStripeSession(session) {
+  if (!session) return { ok: false, errors: ['missing_session'] };
+  const errors = [];
+  const expectedLivemode = getExpectedStripeLivemode();
+  if (expectedLivemode !== null && session.livemode !== expectedLivemode) {
+    errors.push('livemode_mismatch');
+  }
+
+  const expectedPriceIds = getExpectedPriceIds();
+  if (expectedPriceIds.length) {
+    const lineItems = session.line_items?.data || [];
+    const priceIds = lineItems.map((item) => item.price?.id).filter(Boolean);
+    const hasMatch = priceIds.some((id) => expectedPriceIds.includes(id));
+    if (!hasMatch) {
+      errors.push('price_mismatch');
+    }
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+async function ensureStripeSessionWithLineItems(sessionId, session) {
+  const expectedPriceIds = getExpectedPriceIds();
+  const hasLineItems = Boolean(session?.line_items?.data?.length);
+  if (!stripe || !sessionId || !expectedPriceIds.length || hasLineItems) {
+    return session;
+  }
+  try {
+    return await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['line_items.data.price'],
+    });
+  } catch (error) {
+    logger.warn('stripe', 'Stripe session expand failed', {
+      sessionId,
+      message: error.message || error,
+    });
+    return session;
+  }
+}
+
+async function upsertPaymentRecord({
+  sessionId,
+  paid,
+  amountTotal,
+  currency,
+  customerEmail,
+  source,
+  livemode,
+}) {
+  if (!dbReady || !sessionId) return;
+  await dbQuery(
+    `INSERT INTO payments
+      (session_id, paid, amount_total, currency, customer_email, source, livemode)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (session_id) DO UPDATE SET
+      paid = EXCLUDED.paid,
+      amount_total = EXCLUDED.amount_total,
+      currency = EXCLUDED.currency,
+      customer_email = EXCLUDED.customer_email,
+      source = EXCLUDED.source,
+      livemode = EXCLUDED.livemode,
+      updated_at = NOW()`,
+    [
+      sessionId,
+      Boolean(paid),
+      amountTotal || null,
+      currency || null,
+      customerEmail || null,
+      source || null,
+      typeof livemode === 'boolean' ? livemode : null,
+    ]
+  );
+}
+
+async function recordStripeEvent(event) {
+  if (!dbReady || !event?.id) {
+    return { inserted: true };
+  }
+  const sessionId = event?.data?.object?.id || event?.data?.object?.session_id || null;
+  const result = await dbQuery(
+    `INSERT INTO stripe_events (event_id, type, session_id)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (event_id) DO NOTHING`,
+    [event.id, event.type, sessionId]
+  );
+  return { inserted: result.rowCount === 1 };
+}
+
 function hasAccessContext({ sessionId, email }) {
   return Boolean((sessionId || '').trim() || (email || '').trim());
+}
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    logger.error('admin', 'Admin token missing, admin route disabled');
+    return res.status(503).json({ error: 'Admin non configure.' });
+  }
+  const header = req.headers.authorization || '';
+  const bearer = header.toLowerCase().startsWith('bearer ')
+    ? header.slice(7).trim()
+    : '';
+  const token = bearer || req.headers['x-admin-token'] || '';
+  if (token !== ADMIN_TOKEN) {
+    logger.warn('admin', 'Admin access denied', { path: req.originalUrl });
+    return res.status(401).json({ error: 'Non autorise.' });
+  }
+  return next();
 }
 
 async function upsertPaymentStatus({ sessionId, email, paymentStatus, paymentIntent, customerEmail }) {
   const keys = getCompletionKeys({ sessionId, email: email || customerEmail });
   if (!keys.length) return;
-  const store = await readCompletions();
   const patch = {
     paymentStatus: paymentStatus || null,
     paymentIntent: paymentIntent || null,
@@ -661,16 +1262,39 @@ async function upsertPaymentStatus({ sessionId, email, paymentStatus, paymentInt
     paymentUpdatedAt: new Date().toISOString(),
   };
 
-  for (const key of keys) {
-    const existing = store[key] || {};
-    store[key] = {
-      ...existing,
-      ...patch,
-      meta: { ...(existing.meta || {}), ...(patch.meta || {}) },
-    };
+  if (dbReady) {
+    for (const key of keys) {
+      await dbQuery(
+        `INSERT INTO completions
+          (completion_key, payment_status, payment_intent, customer_email, payment_updated_at)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (completion_key) DO UPDATE SET
+          payment_status = EXCLUDED.payment_status,
+          payment_intent = EXCLUDED.payment_intent,
+          customer_email = EXCLUDED.customer_email,
+          payment_updated_at = EXCLUDED.payment_updated_at,
+          updated_at = NOW()`,
+        [key, patch.paymentStatus, patch.paymentIntent, patch.customerEmail, patch.paymentUpdatedAt]
+      );
+    }
+
+    if (LEGACY_JSON_FALLBACK) {
+      const store = await readJsonFile(COMPLETIONS_PATH, {}, 'completions');
+      for (const key of keys) {
+        const existing = store[key] || {};
+        store[key] = { ...existing, ...patch, meta: { ...(existing.meta || {}) } };
+      }
+      await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
+    }
+  } else {
+    const store = await readCompletions();
+    for (const key of keys) {
+      const existing = store[key] || {};
+      store[key] = { ...existing, ...patch, meta: { ...(existing.meta || {}) } };
+    }
+    await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
   }
 
-  await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
   logger.info('selection', 'Stripe session status cached', {
     keys,
     paymentStatus: paymentStatus || '(none)',
@@ -681,21 +1305,57 @@ async function upsertPaymentStatus({ sessionId, email, paymentStatus, paymentInt
 async function markCompletion({ sessionId, email, meta = {} }) {
   const keys = getCompletionKeys({ sessionId, email });
   if (!keys.length) return;
-  const store = await readCompletions();
   const entry = {
     completed: true,
     completedAt: new Date().toISOString(),
     meta,
   };
-  for (const key of keys) {
-    const existing = store[key] || {};
-    store[key] = {
-      ...existing,
-      ...entry,
-      meta: { ...(existing.meta || {}), ...(entry.meta || {}) },
-    };
+
+  if (dbReady) {
+    for (const key of keys) {
+      const existing = await dbQuery(
+        'SELECT meta FROM completions WHERE completion_key = $1',
+        [key]
+      );
+      const existingMeta = existing.rows[0]?.meta || {};
+      const mergedMeta = { ...existingMeta, ...(entry.meta || {}) };
+      await dbQuery(
+        `INSERT INTO completions
+          (completion_key, completed, completed_at, meta)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (completion_key) DO UPDATE SET
+          completed = EXCLUDED.completed,
+          completed_at = EXCLUDED.completed_at,
+          meta = EXCLUDED.meta,
+          updated_at = NOW()`,
+        [key, entry.completed, entry.completedAt, mergedMeta]
+      );
+    }
+
+    if (LEGACY_JSON_FALLBACK) {
+      const store = await readJsonFile(COMPLETIONS_PATH, {}, 'completions');
+      for (const key of keys) {
+        const existing = store[key] || {};
+        store[key] = {
+          ...existing,
+          ...entry,
+          meta: { ...(existing.meta || {}), ...(entry.meta || {}) },
+        };
+      }
+      await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
+    }
+  } else {
+    const store = await readCompletions();
+    for (const key of keys) {
+      const existing = store[key] || {};
+      store[key] = {
+        ...existing,
+        ...entry,
+        meta: { ...(existing.meta || {}), ...(entry.meta || {}) },
+      };
+    }
+    await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
   }
-  await writeJsonFile(COMPLETIONS_PATH, store, 'completions');
   logger.info('selection', 'Completion guard updated', {
     keys,
     sessionId: sessionId || '(none)',
@@ -706,6 +1366,31 @@ async function markCompletion({ sessionId, email, meta = {} }) {
 async function isCompleted({ sessionId, email }) {
   const keys = getCompletionKeys({ sessionId, email });
   if (!keys.length) return { completed: false, key: null };
+  if (dbReady) {
+    const result = await dbQuery(
+      'SELECT completion_key, completed FROM completions WHERE completion_key = ANY($1)',
+      [keys]
+    );
+    const hit = result.rows.find((row) => row.completed);
+    if (hit) {
+      return { completed: true, key: hit.completion_key };
+    }
+
+    if (LEGACY_JSON_FALLBACK) {
+      const store = await readJsonFile(COMPLETIONS_PATH, {}, 'completions');
+      const legacyHit = keys.find((key) => store[key]?.completed);
+      if (legacyHit) {
+        await markCompletion({
+          sessionId,
+          email,
+          meta: store[legacyHit]?.meta || {},
+        });
+        return { completed: true, key: legacyHit };
+      }
+    }
+    return { completed: false, key: null };
+  }
+
   const store = await readCompletions();
   const hit = keys.find((key) => store[key]?.completed);
   return { completed: Boolean(hit), key: hit || null };
@@ -716,19 +1401,50 @@ async function getStripeSessionStatus(sessionId) {
     return { found: false, paid: false, paymentStatus: null };
   }
 
+  if (dbReady) {
+    const existing = await dbQuery('SELECT * FROM payments WHERE session_id = $1', [sessionId]);
+    const payment = existing.rows[0];
+    if (payment?.paid) {
+      return { found: true, paid: true, paymentStatus: 'paid', session: null };
+    }
+  }
+
   try {
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
-    const paid = session.payment_status === 'paid';
-    await upsertPaymentStatus({
-      sessionId,
-      paymentStatus: session.payment_status,
-      paymentIntent: session.payment_intent || null,
-      customerEmail: session.customer_details?.email || session.customer_email || null,
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['line_items.data.price'],
     });
+    const validation = validateStripeSession(session);
+    if (!validation.ok) {
+      logger.warn('stripe', 'Stripe session validation failed', {
+        sessionId,
+        reasons: validation.errors,
+      });
+      return { found: true, paid: false, paymentStatus: 'invalid', session };
+    }
+
+    const paid = session.payment_status === 'paid' || session.status === 'complete';
+    if (paid) {
+      await upsertPaymentRecord({
+        sessionId,
+        paid: true,
+        amountTotal: session.amount_total || null,
+        currency: session.currency || null,
+        customerEmail: session.customer_details?.email || session.customer_email || null,
+        source: 'fallback_api',
+        livemode: session.livemode,
+      });
+      await upsertPaymentStatus({
+        sessionId,
+        paymentStatus: session.payment_status || session.status || null,
+        paymentIntent: session.payment_intent || null,
+        customerEmail: session.customer_details?.email || session.customer_email || null,
+      });
+    }
+
     return {
       found: true,
       paid,
-      paymentStatus: session.payment_status,
+      paymentStatus: session.payment_status || session.status || null,
       session,
     };
   } catch (error) {
@@ -885,18 +1601,25 @@ app.post('/api/selection', async (req, res) => {
 
   try {
     const selections = await readSelections();
+    const submissionId = generateSubmissionId(sessionId);
+    const nowIso = new Date().toISOString();
     const record = {
       domain: normalizedChosen,
       requestedDomain: normalizedRequested || null,
       localPart,
       clientEmail: clientEmail || null,
-      chosenAt: new Date().toISOString(),
+      chosenAt: nowIso,
       hasExistingDomain: hasExistingDomain || null,
       displayName: displayName || null,
       comment: comment || null,
       fullName: fullName || null,
       company: company || null,
       sessionId: sessionId || null,
+      submissionId,
+      sheetStatus: 'pending',
+      lastError: null,
+      attemptCount: 0,
+      nextRetryAt: nowIso,
     };
     selections.push(record);
     await writeJsonFile(SELECTIONS_PATH, selections, 'selections');
@@ -905,20 +1628,25 @@ app.post('/api/selection', async (req, res) => {
       sessionId: sessionId || '(none)',
       email: clientEmail || '(none)',
       requestedDomain: normalizedRequested || null,
+      submissionId,
     });
     Promise.allSettled([
       safeSendNotification(record),
-      forwardToWebhook({
-        fullName: fullName || null,
-        company: company || null,
-        currentEmail: clientEmail || null,
-        hasExistingDomain: hasExistingDomain || null,
-        requestedDomain: normalizedRequested || normalizedChosen,
-        chosenDomain: normalizedChosen,
-        localPart,
-        displayName: displayName || null,
-        comment: comment || null,
-      }),
+      enqueueOutbox(
+        {
+          fullName: fullName || null,
+          company: company || null,
+          currentEmail: clientEmail || null,
+          hasExistingDomain: hasExistingDomain || null,
+          requestedDomain: normalizedRequested || normalizedChosen,
+          chosenDomain: normalizedChosen,
+          localPart,
+          displayName: displayName || null,
+          comment: comment || null,
+          sessionId: sessionId || null,
+        },
+        submissionId
+      ),
     ]).catch(() => {});
     if (!DISABLE_COMPLETION_GUARD) {
       await markCompletion({
@@ -951,6 +1679,48 @@ app.post('/api/selection', async (req, res) => {
   }
 });
 
+app.get('/admin/outbox', requireAdmin, async (req, res) => {
+  try {
+    const outbox = await readOutbox();
+    const pending = outbox.filter((entry) => entry.sheetStatus === 'pending');
+    const failed = outbox.filter((entry) => entry.sheetStatus === 'failed');
+    return res.json({
+      pendingCount: pending.length,
+      failedCount: failed.length,
+      items: [...pending, ...failed],
+    });
+  } catch (error) {
+    logger.error('admin', 'Outbox list failed', {
+      message: error.message || error,
+    });
+    return res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
+app.post('/admin/replay-sheets', requireAdmin, async (req, res) => {
+  try {
+    const outbox = await readOutbox();
+    const pending = outbox.filter((entry) => entry.sheetStatus === 'pending');
+    const nowIso = new Date().toISOString();
+    await Promise.all(
+      pending.map((entry) =>
+        updateOutboxEntry(entry.submissionId, {
+          nextRetryAt: nowIso,
+        })
+      )
+    );
+    pending.forEach((entry) => {
+      attemptOutboxSend(entry.submissionId, 'manual').catch(() => {});
+    });
+    return res.json({ replayed: pending.length });
+  } catch (error) {
+    logger.error('admin', 'Outbox replay failed', {
+      message: error.message || error,
+    });
+    return res.status(500).json({ error: 'Erreur interne.' });
+  }
+});
+
 app.post('/webhook/stripe', async (req, res) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) {
     logger.warn('stripe', 'Webhook received but Stripe is not configured', {
@@ -980,18 +1750,60 @@ app.post('/webhook/stripe', async (req, res) => {
   }
 
   try {
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
-      await upsertPaymentStatus({
-        sessionId: session.id,
-        email: session.customer_email || session.customer_details?.email || null,
-        paymentStatus: session.payment_status || session.status || null,
-        paymentIntent: session.payment_intent || null,
-        customerEmail: session.customer_details?.email || session.customer_email || null,
+    const recorded = await recordStripeEvent(event);
+    if (!recorded.inserted) {
+      logger.info('stripe', 'Webhook duplicate ignored', {
+        eventId: event.id,
+        type: event.type,
       });
-      logger.info('stripe', 'Checkout session completed', {
+      return res.json({ received: true, duplicate: true });
+    }
+
+    if (
+      event.type === 'checkout.session.completed' ||
+      event.type === 'checkout.session.async_payment_succeeded'
+    ) {
+      let session = event.data.object;
+      session = await ensureStripeSessionWithLineItems(session.id, session);
+      const validation = validateStripeSession(session);
+      if (!validation.ok) {
+        logger.warn('stripe', 'Webhook session validation failed', {
+          sessionId: session.id,
+          type: event.type,
+          reasons: validation.errors,
+        });
+        return res.json({ received: true, ignored: true });
+      }
+
+      const paid =
+        session.payment_status === 'paid' ||
+        session.status === 'complete' ||
+        event.type === 'checkout.session.async_payment_succeeded';
+
+      if (paid) {
+        await upsertPaymentRecord({
+          sessionId: session.id,
+          paid: true,
+          amountTotal: session.amount_total || null,
+          currency: session.currency || null,
+          customerEmail: session.customer_details?.email || session.customer_email || null,
+          source: 'webhook',
+          livemode: session.livemode,
+        });
+        await upsertPaymentStatus({
+          sessionId: session.id,
+          email: session.customer_email || session.customer_details?.email || null,
+          paymentStatus: session.payment_status || session.status || null,
+          paymentIntent: session.payment_intent || null,
+          customerEmail: session.customer_details?.email || session.customer_email || null,
+        });
+      }
+
+      logger.info('stripe', 'Checkout session processed', {
         sessionId: session.id,
         paymentStatus: session.payment_status || session.status || '(unknown)',
+        paid,
+        type: event.type,
       });
     } else {
       logger.info('stripe', 'Webhook received (ignored type)', { type: event.type });
@@ -1041,6 +1853,18 @@ app.use((req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  logger.info('process', 'Server ready', { port: PORT });
+async function startServer() {
+  await initDb();
+  setInterval(() => {
+    processDueOutbox().catch(() => {});
+  }, OUTBOX_POLL_INTERVAL_MS);
+  processDueOutbox().catch(() => {});
+
+  app.listen(PORT, () => {
+    logger.info('process', 'Server ready', { port: PORT });
+  });
+}
+
+startServer().catch((error) => {
+  logger.error('process', 'Startup failed', { message: error.message || error });
 });
