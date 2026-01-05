@@ -117,7 +117,12 @@ async function sendWithSmtp({ subject, text }) {
   });
 }
 
-async function sendAlertEmail({ pendingCount, oldestPendingAgeSec, deadCount }) {
+async function sendAlertEmail({
+  pendingCount,
+  oldestPendingAgeSec,
+  deadCount,
+  isTest = false,
+}) {
   if (!ALERT_TO) {
     console.error('Alert skipped: ALERT_TO missing.');
     return;
@@ -126,16 +131,21 @@ async function sendAlertEmail({ pendingCount, oldestPendingAgeSec, deadCount }) 
     console.error('Alert skipped: ALERT_FROM missing.');
     return;
   }
-  const subject =
-    deadCount > 0
-      ? '[ALERTE] Outbox dead detecte'
-      : '[ALERTE] Outbox pending accumule';
-  const lines = [
-    `service: ${SERVICE_NAME}`,
-    `pending_count: ${pendingCount}`,
-    `oldest_pending_age_sec: ${oldestPendingAgeSec}`,
-    `dead_count: ${deadCount}`,
-  ];
+  const subject = isTest
+    ? '[TEST] Outbox monitoring'
+    : deadCount > 0
+    ? '[ALERTE] Outbox dead detecte'
+    : '[ALERTE] Outbox pending accumule';
+  const lines = [];
+  if (isTest) {
+    lines.push('TEST MODE (ALERT_TEST=true)');
+    lines.push("Ceci n'est pas une alerte reelle.");
+  }
+  lines.push(`service: ${SERVICE_NAME}`);
+  lines.push(`timestamp: ${new Date().toISOString()}`);
+  lines.push(`pending_count: ${pendingCount}`);
+  lines.push(`oldest_pending_age_sec: ${oldestPendingAgeSec}`);
+  lines.push(`dead_count: ${deadCount}`);
   if (PUBLIC_BASE_URL) {
     lines.push(`url: ${PUBLIC_BASE_URL}`);
   }
@@ -330,6 +340,7 @@ async function main() {
         pendingCount: 0,
         oldestPendingAgeSec: 0,
         deadCount: 0,
+        isTest: true,
       });
       console.log('Alert test email sent.');
       return;
