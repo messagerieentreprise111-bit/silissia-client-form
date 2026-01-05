@@ -52,8 +52,8 @@ process.on('uncaughtException', (error) => {
   });
 });
 
-// Behind Render's proxy we need trust proxy so rate-limit and IPs work
-app.set('trust proxy', true);
+// Behind Render's proxy we trust a single hop to keep rate-limit effective.
+app.set('trust proxy', 1);
 
 // Stripe webhooks need the raw body for signature verification
 app.use('/webhook/stripe', express.raw({ type: 'application/json' }));
