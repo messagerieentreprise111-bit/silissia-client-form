@@ -8,6 +8,7 @@ const OUTBOX_BATCH_SIZE = parseInt(process.env.OUTBOX_BATCH_SIZE || '20', 10);
 const OUTBOX_MAX_ATTEMPTS = parseInt(process.env.OUTBOX_MAX_ATTEMPTS || '5', 10);
 const DATABASE_SSL = process.env.DATABASE_SSL || '';
 const OUTBOX_MONITOR_ONLY = process.env.OUTBOX_MONITOR_ONLY === 'true';
+const ALERT_TEST = process.env.ALERT_TEST === 'true';
 const ALERT_COOLDOWN_MINUTES = parseInt(process.env.ALERT_COOLDOWN_MINUTES || '30', 10);
 const ALERT_TO = (process.env.ALERT_TO || process.env.NOTIFY_TO || '').trim();
 const ALERT_FROM = (process.env.ALERT_FROM || process.env.SMTP_FROM || process.env.SMTP_USER || '').trim();
@@ -323,6 +324,16 @@ async function main() {
         last_alert_at TIMESTAMPTZ
       )`
     );
+
+    if (ALERT_TEST) {
+      await sendAlertEmail({
+        pendingCount: 0,
+        oldestPendingAgeSec: 0,
+        deadCount: 0,
+      });
+      console.log('Alert test email sent.');
+      return;
+    }
 
     const runStart = Date.now();
     const beforeMetrics = await getOutboxMetrics(pool);
