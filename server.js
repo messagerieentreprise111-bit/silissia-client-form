@@ -321,6 +321,11 @@ async function ensureDbSchema() {
 
 async function initDb() {
   if (!DATABASE_URL) {
+    if (process.env.ALLOW_NO_DB === 'true') {
+      logger.warn('db', 'DATABASE_URL missing, running without database');
+      dbReady = false;
+      return;
+    }
     logger.error('db', 'DATABASE_URL missing, aborting startup');
     throw new Error('DATABASE_URL missing');
   }
@@ -1522,6 +1527,14 @@ app.post('/api/selection', async (req, res) => {
       nextRetryAt: nowIso,
     };
     if (!dbReady) {
+      if (process.env.ALLOW_NO_DB === 'true') {
+        logger.warn('selection', 'DB not ready, skipping persistence (local mode)', {
+          submissionId,
+          chosenDomain: normalizedChosen,
+          email: clientEmail || '(none)',
+        });
+        return res.json({ success: true, skippedDb: true });
+      }
       throw new Error('DB not ready');
     }
     await dbQuery(
@@ -1790,10 +1803,14 @@ app.use((req, res) => {
 
 async function startServer() {
   await initDb();
-  setInterval(() => {
+  if (dbReady) {
+    setInterval(() => {
+      processDueOutbox().catch(() => {});
+    }, OUTBOX_POLL_INTERVAL_MS);
     processDueOutbox().catch(() => {});
-  }, OUTBOX_POLL_INTERVAL_MS);
-  processDueOutbox().catch(() => {});
+  } else {
+    logger.warn('db', 'Outbox processing disabled (DB not ready)');
+  }
 
   app.listen(PORT, () => {
     logger.info('process', 'Server ready', { port: PORT });

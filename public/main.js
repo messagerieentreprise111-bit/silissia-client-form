@@ -18,6 +18,12 @@ const selectionError = document.getElementById('selection-error');
 const confirmSelectionButton = document.getElementById('confirm-selection');
 const sessionInput = document.getElementById('sessionId');
 const domainUnavailable = document.getElementById('domain-unavailable');
+const currentEmailInput = document.getElementById('currentEmail');
+const currentEmailError = document.getElementById('currentEmail-error');
+const currentEmailConfirmInput = document.getElementById('currentEmailConfirm');
+const currentEmailConfirmError = document.getElementById('currentEmailConfirm-error');
+const emailRegex =
+  /^[\w.!#$%&'*+/=?^`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
 
 const apiBase =
   window.location.origin.startsWith('file://') || window.location.protocol === 'file:'
@@ -65,6 +71,76 @@ function resetSelectionState() {
 
 function showLocalError(message) {
   localError.textContent = message || '';
+}
+
+function setInputError(inputEl, hasError) {
+  if (!inputEl) return;
+  inputEl.classList.toggle('input-error', Boolean(hasError));
+}
+
+let currentEmailTouched = false;
+let currentEmailConfirmTouched = false;
+function validateCurrentEmail(showMessage = false) {
+  if (!currentEmailInput || !currentEmailError) return true;
+  const value = (currentEmailInput.value || '').trim();
+  const isValid = emailRegex.test(value);
+  const shouldShow = showMessage || currentEmailTouched;
+
+  if (!value) {
+    const msg = shouldShow ? 'Indiquez votre adresse email actuelle.' : '';
+    currentEmailError.textContent = msg;
+    setInputError(currentEmailInput, shouldShow);
+    currentEmailInput.setCustomValidity(msg);
+    return false;
+  }
+  if (!isValid) {
+    const msg = shouldShow ? 'Indiquez une adresse email valide (ex : prenom@domaine.fr).' : '';
+    currentEmailError.textContent = msg;
+    setInputError(currentEmailInput, shouldShow);
+    currentEmailInput.setCustomValidity(msg);
+    return false;
+  }
+
+  currentEmailError.textContent = '';
+  setInputError(currentEmailInput, false);
+  currentEmailInput.setCustomValidity('');
+  return true;
+}
+
+function validateConfirmEmail(showMessage = false) {
+  if (!currentEmailConfirmInput || !currentEmailConfirmError) return true;
+  const value = (currentEmailConfirmInput.value || '').trim();
+  const primary = (currentEmailInput?.value || '').trim();
+  const isValid = emailRegex.test(value);
+  const matches = isValid && emailRegex.test(primary) && value === primary;
+  const shouldShow = showMessage || currentEmailConfirmTouched;
+
+  if (!value) {
+    const msg = shouldShow ? 'Confirmez votre adresse email.' : '';
+    currentEmailConfirmError.textContent = msg;
+    setInputError(currentEmailConfirmInput, shouldShow);
+    currentEmailConfirmInput.setCustomValidity(msg);
+    return false;
+  }
+  if (!isValid) {
+    const msg = shouldShow ? 'Indiquez une adresse email valide (ex : prenom@domaine.fr).' : '';
+    currentEmailConfirmError.textContent = msg;
+    setInputError(currentEmailConfirmInput, shouldShow);
+    currentEmailConfirmInput.setCustomValidity(msg);
+    return false;
+  }
+  if (!matches) {
+    const msg = shouldShow ? 'Les deux adresses ne correspondent pas.' : '';
+    currentEmailConfirmError.textContent = msg;
+    setInputError(currentEmailConfirmInput, shouldShow);
+    currentEmailConfirmInput.setCustomValidity(msg);
+    return false;
+  }
+
+  currentEmailConfirmError.textContent = '';
+  setInputError(currentEmailConfirmInput, false);
+  currentEmailConfirmInput.setCustomValidity('');
+  return true;
 }
 
 function validateLocalInput(showMessage = false) {
@@ -176,10 +252,63 @@ function renderResults(data) {
   });
 }
 
+function ensureFormComplete() {
+  let ok = true;
+  let firstInvalid = null;
+  requiredFields.forEach((field) => {
+    if (!field.input) return;
+    field.hadValue = true;
+    handleRequiredField(field);
+    if (!field.input.value.trim()) {
+      ok = false;
+      if (!firstInvalid) firstInvalid = field.input;
+    }
+  });
+
+  if (!validateCurrentEmail(true)) {
+    ok = false;
+    if (!firstInvalid && currentEmailInput) firstInvalid = currentEmailInput;
+  }
+  if (!validateConfirmEmail(true)) {
+    ok = false;
+    if (!firstInvalid && currentEmailConfirmInput) firstInvalid = currentEmailConfirmInput;
+  }
+  if (!validateLocalInput(true)) {
+    ok = false;
+    if (!firstInvalid && localInput) firstInvalid = localInput;
+  }
+
+  if (!Array.from(existingDomainRadios || []).some((r) => r.checked)) {
+    ok = false;
+    if (!firstInvalid && existingDomainInfo) {
+      firstInvalid = existingDomainInfo.closest('fieldset') || existingDomainInfo;
+    }
+  }
+
+  if (!ok) {
+    setStatus('Merci de remplir tous les champs obligatoires avant de valider.', 'error');
+    if (firstInvalid?.scrollIntoView) {
+      firstInvalid.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    if (firstInvalid?.focus) {
+      firstInvalid.focus({ preventScroll: true });
+    }
+  }
+  return ok;
+}
+
 async function handleDomainCheck() {
   const domain = input.value.trim();
   const hpValue = honeypot.value.trim();
   if (isSubmitting) return;
+  if (!validateCurrentEmail(true)) {
+    setStatus('Indiquez une adresse email valide (ex : prenom@domaine.fr).', 'error');
+    return;
+  }
+  if (!validateConfirmEmail(true)) {
+    setStatus('Les deux adresses email doivent etre identiques et valides.', 'error');
+    return;
+  }
   if (!validateLocalInput(true)) {
     setStatus(
       'Début d’adresse invalide. 1 à 40 caractères, uniquement lettres, chiffres ou tirets, sans accents (é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç).',
@@ -228,6 +357,9 @@ async function submitSelection() {
   if (isSubmitting) return;
   if (!disableCompletionGuard && !sessionIdParam && !(sessionInput?.value || '').trim()) {
     setStatus('Effectuez le paiement avant de remplir le formulaire.', 'error');
+    return;
+  }
+  if (!ensureFormComplete()) {
     return;
   }
   const payload = {
@@ -406,12 +538,6 @@ const requiredFields = [
     hadValue: false,
   },
   {
-    input: document.getElementById('currentEmail'),
-    error: document.getElementById('currentEmail-error'),
-    message: 'Indiquez votre adresse email actuelle.',
-    hadValue: false,
-  },
-  {
     input: document.getElementById('displayName'),
     error: document.getElementById('displayName-error'),
     message: "Indiquez le nom d’expéditeur à afficher.",
@@ -443,3 +569,29 @@ requiredFields.forEach((field) => {
     handleRequiredField(field);
   });
 });
+
+if (currentEmailInput) {
+  currentEmailInput.addEventListener('input', () => {
+    validateCurrentEmail(false);
+    if (currentEmailConfirmInput) {
+      validateConfirmEmail(false);
+    }
+  });
+  currentEmailInput.addEventListener('blur', () => {
+    currentEmailTouched = true;
+    validateCurrentEmail(true);
+    if (currentEmailConfirmInput) {
+      validateConfirmEmail(true);
+    }
+  });
+}
+
+if (currentEmailConfirmInput) {
+  currentEmailConfirmInput.addEventListener('input', () => {
+    validateConfirmEmail(false);
+  });
+  currentEmailConfirmInput.addEventListener('blur', () => {
+    currentEmailConfirmTouched = true;
+    validateConfirmEmail(true);
+  });
+}

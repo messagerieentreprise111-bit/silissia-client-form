@@ -199,6 +199,11 @@ input[type="radio"] {
   margin-top: 3px;
 }
 
+input.input-error {
+  border: 1px solid #ef4444 !important;
+  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.22) !important;
+}
+
 input[type="text"],
 input[type="email"],
 textarea {

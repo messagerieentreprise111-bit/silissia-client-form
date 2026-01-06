@@ -35,6 +35,12 @@
             <small>Cette adresse sera utilisée pour vous envoyer vos accès.</small>
             <p class="field-error" id="currentEmail-error"></p>
           </div>
+          <div class="form-stack">
+            <label for="currentEmailConfirm">Confirmez votre adresse email</label>
+            <input id="currentEmailConfirm" name="currentEmailConfirm" type="email" required />
+            <small>Saisissez à nouveau votre adresse email.</small>
+            <p class="field-error" id="currentEmailConfirm-error"></p>
+          </div>
           <fieldset class="form-stack">
             <legend class="sr-only">
               Disposez-vous déjà d'un nom de domaine ou d'une adresse email professionnelle active pour votre
@@ -136,7 +142,7 @@
           <p class="field-error" id="selection-error"></p>
           <p class="warning-text">
             Une fois cette adresse validée, la configuration sera lancée et elle ne pourra plus être modifiée. Toute
-            nouvelle adresse nécessitera une nouvelle commande (18 €).
+            nouvelle adresse nécessitera une nouvelle commande.
           </p>
           <div class="confirm-actions">
             <button type="button" id="confirm-selection">Valider cette adresse</button>
