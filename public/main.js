@@ -401,7 +401,7 @@ async function submitSelection() {
     chosenDomain: (chosenDomainInput?.value || '').trim().toLowerCase(),
     localPart: (localInput.value || '').trim().toLowerCase(),
     displayName: (form.displayName?.value || '').trim(),
-    comment: (form.comment?.value || '').trim(),
+    comment: '',
     honeypot: hpValue,
     sessionId: sessionIdParam || (sessionInput?.value || '').trim(),
   };
