@@ -26,9 +26,12 @@ const APPS_SCRIPT_TIMEOUT_MS = parseInt(process.env.APPS_SCRIPT_TIMEOUT_MS || '1
 const OUTBOX_POLL_INTERVAL_MS = parseInt(process.env.OUTBOX_POLL_INTERVAL_MS || '60000', 10);
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_SETUP_PRICE_ID = process.env.STRIPE_SETUP_PRICE_ID || '';
-const STRIPE_SUBSCRIPTION_PRICE_ID = process.env.STRIPE_SUBSCRIPTION_PRICE_ID || '';
 const STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY = process.env.STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY || '';
+const STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY_UPSELL =
+  process.env.STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY_UPSELL || '';
 const STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY = process.env.STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY || '';
+const STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY_UPSELL =
+  process.env.STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY_UPSELL || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || '').trim();
 const stripe = STRIPE_SECRET_KEY
@@ -118,9 +121,10 @@ logger.info('process', 'SendGrid config summary', {
 logger.info('process', 'Stripe config summary', {
   enabled: Boolean(stripe),
   hasSetupPrice: Boolean(STRIPE_SETUP_PRICE_ID),
-  hasSubscriptionPrice: Boolean(STRIPE_SUBSCRIPTION_PRICE_ID),
   hasSubscriptionMonthly: Boolean(STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY),
+  hasSubscriptionMonthlyUpsell: Boolean(STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY_UPSELL),
   hasSubscriptionYearly: Boolean(STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY),
+  hasSubscriptionYearlyUpsell: Boolean(STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY_UPSELL),
   webhookConfigured: Boolean(STRIPE_WEBHOOK_SECRET),
 });
 logger.info('stripe', 'Whitelist prices count', {
@@ -547,6 +551,7 @@ function logSubscriptionValidationDecision({
   livemode,
   source,
   matchedPriceId,
+  matchedPriceLabel,
   allowedPriceIds,
   lineItemPriceIds,
   sessionSummary,
@@ -565,6 +570,7 @@ function logSubscriptionValidationDecision({
     livemode: typeof livemode === 'boolean' ? livemode : null,
     source: normalizeDecisionSource(source),
     matchedPriceId: matchedPriceId || null,
+    matchedPriceLabel: matchedPriceLabel || null,
     allowedPriceIds: allowedPriceIds || [],
     lineItemPriceIds: lineItemPriceIds || [],
     session: sessionSummary || {},
@@ -1255,33 +1261,59 @@ function getExpectedPriceIds() {
   return [
     STRIPE_SETUP_PRICE_ID,
     STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY,
+    STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY_UPSELL,
     STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY,
-    STRIPE_SUBSCRIPTION_PRICE_ID,
+    STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY_UPSELL,
   ].filter(Boolean);
 }
 
 function getAllowedSubscriptionPriceIds() {
   return [
     STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY,
+    STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY_UPSELL,
     STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY,
-    STRIPE_SUBSCRIPTION_PRICE_ID,
+    STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY_UPSELL,
   ].filter(Boolean);
+}
+
+function getPriceMatchDetails(priceId) {
+  if (!priceId) return null;
+  if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY) {
+    return { billingPeriod: 'monthly', label: 'monthly_normal' };
+  }
+  if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY_UPSELL) {
+    return { billingPeriod: 'monthly', label: 'monthly_upsell' };
+  }
+  if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY) {
+    return { billingPeriod: 'yearly', label: 'yearly_normal' };
+  }
+  if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY_UPSELL) {
+    return { billingPeriod: 'yearly', label: 'yearly_upsell' };
+  }
+  if (priceId === STRIPE_SETUP_PRICE_ID) {
+    return { billingPeriod: 'setup', label: 'setup' };
+  }
+  return null;
 }
 
 function getSubscriptionInfoFromPriceIds(priceIds) {
   const allowed = new Set(getExpectedPriceIds());
   for (const priceId of priceIds || []) {
     if (!priceId || !allowed.has(priceId)) continue;
-    if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY) {
-      logger.info('stripe', 'Price matched monthly', { priceId });
+    const details = getPriceMatchDetails(priceId);
+    if (details?.billingPeriod === 'monthly') {
+      logger.info('stripe', 'Price matched monthly', { priceId, label: details.label });
       return { subscriptionPriceId: priceId, billingPeriod: 'monthly' };
     }
-    if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY) {
-      logger.info('stripe', 'Price matched yearly', { priceId });
+    if (details?.billingPeriod === 'yearly') {
+      logger.info('stripe', 'Price matched yearly', { priceId, label: details.label });
       return { subscriptionPriceId: priceId, billingPeriod: 'yearly' };
     }
-    logger.info('stripe', 'Price matched legacy', { priceId });
-    return { subscriptionPriceId: priceId, billingPeriod: 'legacy' };
+    logger.info('stripe', 'Price matched non-subscription', {
+      priceId,
+      label: details?.label || 'unknown',
+    });
+    return { subscriptionPriceId: priceId, billingPeriod: details?.billingPeriod || null };
   }
   return { subscriptionPriceId: null, billingPeriod: null };
 }
@@ -1292,16 +1324,20 @@ function getSubscriptionInfoFromSession(session) {
   for (const item of lineItems) {
     const priceId = item?.price?.id || null;
     if (!priceId || !allowed.has(priceId)) continue;
-    if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY) {
-      logger.info('stripe', 'Price matched monthly', { priceId });
+    const details = getPriceMatchDetails(priceId);
+    if (details?.billingPeriod === 'monthly') {
+      logger.info('stripe', 'Price matched monthly', { priceId, label: details.label });
       return { subscriptionPriceId: priceId, billingPeriod: 'monthly' };
     }
-    if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY) {
-      logger.info('stripe', 'Price matched yearly', { priceId });
+    if (details?.billingPeriod === 'yearly') {
+      logger.info('stripe', 'Price matched yearly', { priceId, label: details.label });
       return { subscriptionPriceId: priceId, billingPeriod: 'yearly' };
     }
-    logger.info('stripe', 'Price matched legacy', { priceId });
-    return { subscriptionPriceId: priceId, billingPeriod: 'legacy' };
+    logger.info('stripe', 'Price matched non-subscription', {
+      priceId,
+      label: details?.label || 'unknown',
+    });
+    return { subscriptionPriceId: priceId, billingPeriod: details?.billingPeriod || null };
   }
   return { subscriptionPriceId: null, billingPeriod: null };
 }
@@ -1590,6 +1626,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
   const sessionStatus = session.status || null;
   const hasAllowedPrice = lineItemPriceIds.some((id) => expectedPriceIds.has(id));
   const matchedPriceId = lineItemPriceIds.find((id) => expectedPriceIds.has(id)) || null;
+  const matchedPriceLabel = matchedPriceId ? getPriceMatchDetails(matchedPriceId)?.label : null;
   const paymentOk = paymentStatus === 'paid' || sessionStatus === 'complete';
   const allowedPriceIds = Array.from(expectedPriceIds);
 
@@ -1620,6 +1657,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         allowedPriceIds,
         lineItemPriceIds,
         matchedPriceId,
+        matchedPriceLabel,
         session: {
           payment_status: session.payment_status || '(none)',
           status: session.status || '(none)',
@@ -1649,6 +1687,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         allowedPriceIds,
         lineItemPriceIds,
         matchedPriceId,
+        matchedPriceLabel,
         session: {
           payment_status: paymentStatus || '(none)',
           status: sessionStatus || '(none)',
@@ -1693,6 +1732,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
           allowedPriceIds,
           lineItemPriceIds,
           matchedPriceId,
+          matchedPriceLabel,
           session: {
             payment_status: paymentStatus || '(none)',
             status: sessionStatus || '(none)',
@@ -1719,6 +1759,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         allowedPriceIds,
         lineItemPriceIds,
         matchedPriceId,
+        matchedPriceLabel,
         session: {
           payment_status: paymentStatus || '(none)',
           status: sessionStatus || '(none)',
@@ -1764,6 +1805,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         allowedPriceIds,
         lineItemPriceIds,
         matchedPriceId,
+        matchedPriceLabel,
         session: {
           payment_status: paymentStatus || '(none)',
           status: sessionStatus || '(none)',
@@ -1792,6 +1834,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         allowedPriceIds,
         lineItemPriceIds,
         matchedPriceId,
+        matchedPriceLabel,
         session: {
           payment_status: paymentStatus || '(none)',
           status: sessionStatus || '(none)',
@@ -1821,6 +1864,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         allowedPriceIds,
         lineItemPriceIds,
         matchedPriceId,
+        matchedPriceLabel,
         session: {
           payment_status: paymentStatus || '(none)',
           status: sessionStatus || '(none)',
@@ -1860,6 +1904,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         allowedPriceIds,
         lineItemPriceIds,
         matchedPriceId,
+        matchedPriceLabel,
         session: {
           payment_status: paymentStatus || '(none)',
           status: sessionStatus || '(none)',
@@ -1913,6 +1958,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         allowedPriceIds,
         lineItemPriceIds,
         matchedPriceId,
+        matchedPriceLabel,
         session: {
           payment_status: paymentStatus || '(none)',
           status: sessionStatus || '(none)',
@@ -1943,6 +1989,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         allowedPriceIds,
         lineItemPriceIds,
         matchedPriceId,
+        matchedPriceLabel,
         session: {
           payment_status: paymentStatus || '(none)',
           status: sessionStatus || '(none)',
@@ -1988,6 +2035,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         allowedPriceIds,
         lineItemPriceIds,
         matchedPriceId,
+        matchedPriceLabel,
         session: {
           payment_status: paymentStatus || '(none)',
           status: sessionStatus || '(none)',
@@ -2033,6 +2081,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       allowedPriceIds,
       lineItemPriceIds,
       matchedPriceId,
+      matchedPriceLabel,
       session: {
         payment_status: paymentStatus || '(none)',
         status: sessionStatus || '(none)',
@@ -2114,6 +2163,7 @@ app.get('/api/completion', completionIpLimiter, completionSessionLimiter, async 
       livemode: stripeStatus?.session?.livemode,
       source,
       matchedPriceId: decisionContext.matchedPriceId || null,
+      matchedPriceLabel: decisionContext.matchedPriceLabel || null,
       allowedPriceIds: decisionContext.allowedPriceIds || getExpectedPriceIds(),
       lineItemPriceIds: decisionContext.lineItemPriceIds || [],
       sessionSummary: decisionContext.session || {
@@ -2489,6 +2539,9 @@ app.post('/webhook/stripe', async (req, res) => {
       const webhookAllowedPriceIds = getExpectedPriceIds();
       const webhookMatchedPriceId =
         webhookLineItemPriceIds.find((id) => webhookAllowedPriceIds.includes(id)) || null;
+      const webhookMatchedPriceLabel = webhookMatchedPriceId
+        ? getPriceMatchDetails(webhookMatchedPriceId)?.label
+        : null;
       const validation = validateStripeSession(session);
       if (!validation.ok) {
         logger.warn('stripe', 'Webhook session validation failed', {
@@ -2505,6 +2558,7 @@ app.post('/webhook/stripe', async (req, res) => {
             livemode: session.livemode,
             source: 'unknown',
             matchedPriceId: webhookMatchedPriceId,
+            matchedPriceLabel: webhookMatchedPriceLabel,
             allowedPriceIds: webhookAllowedPriceIds,
             lineItemPriceIds: webhookLineItemPriceIds,
             sessionSummary: {
@@ -2565,6 +2619,7 @@ app.post('/webhook/stripe', async (req, res) => {
           livemode: session.livemode,
           source: 'unknown',
           matchedPriceId: webhookMatchedPriceId,
+          matchedPriceLabel: webhookMatchedPriceLabel,
           allowedPriceIds: webhookAllowedPriceIds,
           lineItemPriceIds: webhookLineItemPriceIds,
           sessionSummary: {
@@ -2651,3 +2706,5 @@ startServer().catch((error) => {
   logger.error('process', 'Startup failed', { message: error.message || error });
   process.exit(1);
 });
+
+
