@@ -68,6 +68,10 @@ app.use(
     },
   })
 );
+app.use((req, res, next) => {
+  res.set('Referrer-Policy', 'no-referrer');
+  next();
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/config.js', (req, res) => {
@@ -454,6 +458,22 @@ function generateSubmissionId(sessionId) {
   return base ? `${base}-${randomPart}` : randomPart;
 }
 
+function redactSessionId(value) {
+  const raw = (value || '').trim();
+  if (!raw) return '(none)';
+  if (raw.length <= 8) return `${raw.slice(0, 4)}...`;
+  return `${raw.slice(0, 8)}...${raw.slice(-4)}`;
+}
+
+function logSubscriptionDecision(sessionId, state, reason, details = {}) {
+  logger.info('stripe', 'Subscription validation decision', {
+    sessionId: redactSessionId(sessionId),
+    state,
+    reason,
+    ...details,
+  });
+}
+
 function getNextRetryDelayMs(attemptCount) {
   const minutesByAttempt = [1, 5, 15, 60, 360];
   const index = Math.max(0, attemptCount - 1);
@@ -830,13 +850,13 @@ async function sendStripeWebhookAlert({ eventType, sessionId, errorMessage }) {
     }
     logger.info('stripe-alert', 'Stripe webhook alert email sent', {
       eventType: eventType || '(unknown)',
-      sessionId: sessionId || '(unknown)',
+      sessionId: redactSessionId(sessionId),
     });
   } catch (error) {
     logger.error('stripe-alert', 'Stripe webhook alert email failed', {
       message: error.message || error,
       eventType: eventType || '(unknown)',
-      sessionId: sessionId || '(unknown)',
+      sessionId: redactSessionId(sessionId),
     });
   }
 }
@@ -1366,7 +1386,7 @@ async function markCompletion({ sessionId, email, meta = {} }) {
   }
   logger.info('selection', 'Completion guard updated', {
     keys,
-    sessionId: sessionId || '(none)',
+    sessionId: redactSessionId(sessionId),
     email: email || '(none)',
   });
 }
@@ -1407,7 +1427,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         return { found: true, paid: true, paymentStatus: 'paid', session: null, state: 'paid' };
       }
       logger.warn('stripe', 'Cached payment missing allowed price, forcing Stripe fetch', {
-        sessionId,
+        sessionId: redactSessionId(sessionId),
         priceId: payment.subscription_price_id || '(none)',
       });
     }
@@ -1418,7 +1438,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
     session = await stripe.checkout.sessions.retrieve(sessionId);
   } catch (error) {
     logger.error('stripe', 'Stripe session lookup failed', {
-      sessionId,
+      sessionId: redactSessionId(sessionId),
       message: error.message || error,
       type: error?.type,
     });
@@ -1433,7 +1453,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       .filter(Boolean);
   } catch (error) {
     logger.warn('stripe', 'Stripe line items lookup failed', {
-      sessionId,
+      sessionId: redactSessionId(sessionId),
       message: error.message || error,
       type: error?.type,
     });
@@ -1449,7 +1469,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
 
   if (logContext) {
     logger.info('stripe', 'Completion session summary', {
-      sessionId,
+      sessionId: redactSessionId(sessionId),
       context: logContext,
       ...sessionSummary,
     });
@@ -1458,7 +1478,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
   const expectedLivemode = getExpectedStripeLivemode();
   if (expectedLivemode !== null && session.livemode !== expectedLivemode) {
     logger.warn('stripe', 'Stripe session livemode mismatch', {
-      sessionId,
+      sessionId: redactSessionId(sessionId),
       expectedLivemode,
       livemode: session.livemode,
     });
@@ -1558,8 +1578,33 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
     };
   }
 
+  if (sessionStatus === 'expired') {
+    logSubscriptionDecision(sessionId, 'denied', 'session_expired', {
+      sessionStatus: sessionStatus || '(none)',
+      sessionPaymentStatus: paymentStatus || '(none)',
+    });
+    return {
+      found: true,
+      paid: false,
+      paymentStatus,
+      session,
+      state: 'denied',
+      reason: 'session_expired',
+      priceIds: lineItemPriceIds,
+    };
+  }
+
   const subscriptionId = session.subscription;
   if (!subscriptionId) {
+    logSubscriptionDecision(
+      sessionId,
+      isPendingPaymentStatus(paymentStatus, sessionStatus) ? 'retry' : 'denied',
+      paymentOk ? 'no_allowed_price' : 'subscription_not_active',
+      {
+        sessionStatus: sessionStatus || '(none)',
+        sessionPaymentStatus: paymentStatus || '(none)',
+      }
+    );
     return {
       found: true,
       paid: false,
@@ -1578,7 +1623,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
     });
   } catch (error) {
     logger.warn('stripe', 'Stripe subscription lookup failed', {
-      sessionId,
+      sessionId: redactSessionId(sessionId),
       subscriptionId,
       message: error.message || error,
       type: error?.type,
@@ -1594,6 +1639,19 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
     };
   }
 
+  const invoice = subscription.latest_invoice || null;
+  const paymentIntentStatus = invoice?.payment_intent?.status || null;
+  logger.info('stripe', 'Subscription invoice summary', {
+    sessionId: redactSessionId(sessionId),
+    subscriptionId: subscriptionId || '(none)',
+    subscriptionStatus: subscription.status || '(none)',
+    sessionStatus: sessionStatus || '(none)',
+    sessionPaymentStatus: paymentStatus || '(none)',
+    invoiceStatus: invoice?.status || '(none)',
+    invoicePaid: Boolean(invoice?.paid),
+    paymentIntentStatus: paymentIntentStatus || '(none)',
+  });
+
   const allowedSubscriptionPriceIds = new Set(getAllowedSubscriptionPriceIds());
   const subscriptionPriceIds = (subscription.items?.data || [])
     .map((item) => item?.price?.id || null)
@@ -1602,6 +1660,10 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
     allowedSubscriptionPriceIds.has(id)
   );
   if (!hasAllowedSubscriptionPrice) {
+    logSubscriptionDecision(sessionId, 'denied', 'no_allowed_price', {
+      subscriptionStatus: subscription.status || '(none)',
+      invoiceStatus: invoice?.status || '(none)',
+    });
     return {
       found: true,
       paid: false,
@@ -1614,28 +1676,51 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
   }
 
   if (subscription.status !== 'active') {
+    const terminalStatuses = new Set(['canceled', 'incomplete_expired']);
+    const state = terminalStatuses.has(subscription.status) ? 'denied' : 'retry';
+    logSubscriptionDecision(sessionId, state, 'subscription_not_active', {
+      subscriptionStatus: subscription.status || '(none)',
+      invoiceStatus: invoice?.status || '(none)',
+    });
     return {
       found: true,
       paid: false,
       paymentStatus,
       session,
-      state: 'denied',
+      state,
       reason: 'subscription_not_active',
       priceIds: lineItemPriceIds,
     };
   }
 
-  const invoice = subscription.latest_invoice || null;
-  const invoicePaid = Boolean(invoice?.paid || invoice?.status === 'paid');
+  const invoicePaid = Boolean(
+    invoice?.paid ||
+      invoice?.status === 'paid' ||
+      paymentIntentStatus === 'succeeded'
+  );
   if (!invoicePaid) {
-    const invoiceStatus = invoice?.status || invoice?.payment_intent?.status || '(none)';
+    const invoiceStatus = invoice?.status || '(none)';
     const pendingInvoiceStatuses = new Set(['open', 'draft', 'processing', 'requires_action']);
+    const failedInvoiceStatuses = new Set(['uncollectible', 'void']);
+    const failedIntentStatuses = new Set(['canceled', 'requires_payment_method']);
+    const isExplicitFailure =
+      failedInvoiceStatuses.has(invoiceStatus) || failedIntentStatuses.has(paymentIntentStatus);
+    const state = isExplicitFailure
+      ? 'denied'
+      : pendingInvoiceStatuses.has(invoiceStatus)
+      ? 'retry'
+      : 'retry';
+    logSubscriptionDecision(sessionId, state, 'invoice_not_paid', {
+      subscriptionStatus: subscription.status || '(none)',
+      invoiceStatus,
+      paymentIntentStatus: paymentIntentStatus || '(none)',
+    });
     return {
       found: true,
       paid: false,
       paymentStatus,
       session,
-      state: pendingInvoiceStatuses.has(invoiceStatus) ? 'retry' : 'denied',
+      state,
       reason: 'invoice_not_paid',
       priceIds: lineItemPriceIds,
     };
@@ -1677,7 +1762,7 @@ app.get('/api/completion', async (req, res) => {
   if (!DISABLE_COMPLETION_GUARD && !hasAccessContext({ sessionId, email })) {
     logger.warn('selection', 'Completion check denied: missing context', {
       path: req.originalUrl,
-      sessionId: sessionId || '(none)',
+      sessionId: redactSessionId(sessionId),
       email: email || '(none)',
     });
     return res.status(400).json({ error: 'Acces non valide.' });
@@ -1685,7 +1770,7 @@ app.get('/api/completion', async (req, res) => {
 
   try {
     logger.info('stripe', 'Completion check received', {
-      sessionId: sessionId || '(none)',
+      sessionId: redactSessionId(sessionId),
       path: req.originalUrl,
     });
     const { completed, key } = await isCompleted({ sessionId, email });
@@ -1697,7 +1782,7 @@ app.get('/api/completion', async (req, res) => {
       : null;
     if (!DISABLE_COMPLETION_GUARD && stripeStatus && stripeStatus.state === 'retry') {
       logger.info('selection', 'Completion check pending, retry advised', {
-        sessionId: sessionId || '(none)',
+        sessionId: redactSessionId(sessionId),
         paymentStatus: stripeStatus?.paymentStatus || '(none)',
         reason: stripeStatus?.reason || '(none)',
       });
@@ -1711,7 +1796,7 @@ app.get('/api/completion', async (req, res) => {
     }
     if (!DISABLE_COMPLETION_GUARD && !stripeStatus?.paid) {
       logger.warn('selection', 'Completion check denied: unpaid session', {
-        sessionId: sessionId || '(none)',
+        sessionId: redactSessionId(sessionId),
         email: email || '(none)',
         paymentStatus: stripeStatus?.paymentStatus || '(none)',
         reason: stripeStatus?.reason || '(none)',
@@ -1720,7 +1805,7 @@ app.get('/api/completion', async (req, res) => {
     }
     if (completed) {
       logger.warn('selection', 'Completion already marked', {
-        sessionId: sessionId || '(none)',
+        sessionId: redactSessionId(sessionId),
         email: email || '(none)',
         key: key || '(none)',
         path: req.originalUrl,
@@ -1733,7 +1818,7 @@ app.get('/api/completion', async (req, res) => {
     });
   } catch (error) {
     logger.error('selection', 'Completion lookup failed', {
-      sessionId: sessionId || '(none)',
+      sessionId: redactSessionId(sessionId),
       email: email || '(none)',
       path: req.originalUrl,
       message: error.message || error,
@@ -1760,7 +1845,7 @@ app.post('/api/selection', async (req, res) => {
   const company = (req.body?.company || '').trim();
 
   logger.info('selection', 'Selection payload received', {
-    sessionId: sessionId || '(none)',
+    sessionId: redactSessionId(sessionId),
     currentEmail: clientEmail || '(none)',
     chosenDomain: normalizedChosen || req.body?.chosenDomain || '(none)',
     requestedDomain: normalizedRequested || req.body?.requestedDomain || '(none)',
@@ -1800,7 +1885,7 @@ app.post('/api/selection', async (req, res) => {
     const { completed, key } = await isCompleted({ sessionId, email: clientEmail });
     if (completed) {
       logger.warn('selection', 'Form already completed', {
-        sessionId: sessionId || '(none)',
+        sessionId: redactSessionId(sessionId),
         email: clientEmail || '(none)',
         completionKey: key || '(none)',
         path: req.originalUrl,
@@ -1809,7 +1894,7 @@ app.post('/api/selection', async (req, res) => {
     }
     if (!hasAccessContext({ sessionId, email: clientEmail })) {
       logger.warn('selection', 'Selection rejected: missing context', {
-        sessionId: sessionId || '(none)',
+        sessionId: redactSessionId(sessionId),
         email: clientEmail || '(none)',
         path: req.originalUrl,
       });
@@ -1817,7 +1902,7 @@ app.post('/api/selection', async (req, res) => {
     }
     if (!sessionId) {
       logger.warn('selection', 'Selection rejected: missing Stripe session', {
-        sessionId: '(none)',
+        sessionId: redactSessionId(sessionId),
         email: clientEmail || '(none)',
         path: req.originalUrl,
       });
@@ -1827,7 +1912,7 @@ app.post('/api/selection', async (req, res) => {
     const stripeStatus = await getStripeSessionStatus(sessionId);
     if (!stripeStatus?.paid) {
       logger.warn('selection', 'Selection rejected: unpaid session', {
-        sessionId: sessionId || '(none)',
+        sessionId: redactSessionId(sessionId),
         email: clientEmail || '(none)',
         paymentStatus: stripeStatus?.paymentStatus || '(none)',
         path: req.originalUrl,
@@ -1893,7 +1978,7 @@ app.post('/api/selection', async (req, res) => {
     );
     logger.info('selection', 'Selection stored', {
       chosenDomain: normalizedChosen,
-      sessionId: sessionId || '(none)',
+      sessionId: redactSessionId(sessionId),
       email: clientEmail || '(none)',
       requestedDomain: normalizedRequested || null,
       submissionId,
@@ -1939,7 +2024,7 @@ app.post('/api/selection', async (req, res) => {
       message: error.message || error,
       chosenDomain: normalizedChosen,
       requestedDomain: normalizedRequested || '(none)',
-      sessionId: sessionId || '(none)',
+      sessionId: redactSessionId(sessionId),
       clientEmail: clientEmail || '(none)',
       path: req.originalUrl,
     });
@@ -2047,7 +2132,7 @@ app.post('/webhook/stripe', async (req, res) => {
       const validation = validateStripeSession(session);
       if (!validation.ok) {
         logger.warn('stripe', 'Webhook session validation failed', {
-          sessionId: session.id,
+          sessionId: redactSessionId(session.id),
           type: event.type,
           reasons: validation.errors,
         });
@@ -2082,7 +2167,7 @@ app.post('/webhook/stripe', async (req, res) => {
       }
 
       logger.info('stripe', 'Checkout session processed', {
-        sessionId: session.id,
+        sessionId: redactSessionId(session.id),
         paymentStatus: session.payment_status || session.status || '(unknown)',
         paid,
         type: event.type,
