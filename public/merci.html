@@ -1,173 +1,833 @@
 <!doctype html>
+
+
+
 <html lang="fr">
+
+
+
   <head>
+
+
+
     <meta charset="UTF-8" />
+
+
+
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+
+
     <title>Formulaire déjà complété</title>
+
+
+
     <link rel="stylesheet" href="./style.css" />
+
+
+
     <style>
+
+
+
       body {
+
+
+
         margin: 0;
+
+
+
         min-height: 100vh;
+
+
+
         display: flex;
+
+
+
         align-items: center;
+
+
+
         justify-content: center;
+
+
+
         padding: 48px 20px;
+
+
+
         background:
+
+
+
           radial-gradient(120% 120% at 10% 20%, rgba(37, 99, 235, 0.12), transparent),
+
+
+
           radial-gradient(90% 90% at 82% 12%, rgba(14, 165, 233, 0.12), transparent),
+
+
+
           linear-gradient(135deg, #f9fbff 0%, #eef2ff 45%, #f7fbff 100%);
+
+
+
         color: #0c1635;
+
+
+
         font-family: "Manrope", system-ui, -apple-system, "Segoe UI", sans-serif;
+
+
+
       }
+
+
+
       .merci-container {
+
+
+
         position: relative;
+
+
+
         max-width: 860px;
+
+
+
         width: min(96vw, 860px);
+
+
+
         margin: 24px auto;
+
+
+
         background: linear-gradient(135deg, rgba(37, 99, 235, 0.06), rgba(14, 165, 233, 0.08)), #ffffff;
+
+
+
         border: 1px solid rgba(37, 99, 235, 0.1);
+
+
+
         border-radius: 18px;
+
+
+
         padding: 32px 34px;
+
+
+
         box-shadow: 0 24px 70px rgba(15, 23, 42, 0.12);
+
+
+
         overflow: hidden;
+
+
+
       }
+
+
+
       .merci-container::before {
+
+
+
         content: "";
+
+
+
         position: absolute;
+
+
+
         inset: -30% auto auto 55%;
+
+
+
         width: 480px;
+
+
+
         height: 480px;
+
+
+
         background: radial-gradient(circle, rgba(255, 255, 255, 0.28) 0, transparent 60%);
+
+
+
         transform: rotate(-10deg);
+
+
+
         pointer-events: none;
+
+
+
       }
+
+
+
       .merci-title {
+
+
+
         margin: 0 0 12px;
+
+
+
         font-size: 1.85rem;
+
+
+
         letter-spacing: -0.02em;
+
+
+
       }
+
+
+
       .merci-body {
+
+
+
         margin: 0 0 14px;
+
+
+
         color: #58607a;
+
+
+
         line-height: 1.7;
+
+
+
       }
+
+
+
       hr {
+
+
+
         border: none;
+
+
+
         border-top: 1px solid #e5e8ef;
+
+
+
         margin: 22px 0 16px;
+
+
+
       }
+
+
+
       .cta-group {
+
+
+
         display: grid;
+
+
+
         gap: 10px;
+
+
+
         grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+
+
+
         margin-top: 12px;
+
+
+
       }
+
+      .cta-item {
+
+        display: flex;
+
+        flex-direction: column;
+
+        gap: 4px;
+
+      }
+
+
+
       .cta {
+
+
+
         display: inline-flex;
+
+
+
         align-items: center;
+
+
+
         justify-content: center;
-        padding: 12px 16px;
+
+
+
+        padding: 12px 22px;
+
+
+
         border-radius: 12px;
+
+
+
         font-weight: 700;
+
+
+
+        font-size: 1.02rem;
+
+
+
         text-decoration: none;
+
+
+
         transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease, border-color 120ms ease;
+
+
+
+        align-self: flex-start;
+
+
+
       }
+
+
+
       .cta-primary {
+
+
+
         background: linear-gradient(120deg, #2563eb, #0ea5e9);
+
+
+
         color: #f8fafc;
+
+
+
         box-shadow: 0 16px 32px rgba(37, 99, 235, 0.28);
+
+
+
         border: 1px solid transparent;
+
+
+
       }
+
+
+
       .cta-primary .cta-title,
+
+
+
       .cta-primary .cta-sub {
+
+
+
         color: #f8fafc;
+
+
+
       }
+
+
+
       .cta-primary:hover {
+
+
+
         transform: translateY(-1px);
+
+
+
         box-shadow: 0 18px 40px rgba(37, 99, 235, 0.38);
+
+
+
         filter: brightness(1.02);
+
+
+
       }
+
+
+
       .cta-meta {
-        margin: 6px 0 12px;
+
+
+
+        margin: 6px 0 6px;
+
+
+
         font-size: 0.95rem;
+
+
+
         color: #58607a;
+
+
+
         font-weight: 500;
+
+
+
       }
+
+
+
       .cta-secondary {
+
+
+
         background: transparent;
+
+
+
         border: 1px solid #2563eb;
+
+
+
         color: #2563eb;
+
+
+
       }
+
+
+
       .cta-secondary:hover {
+
+
+
         transform: translateY(-1px);
+
+
+
         box-shadow: 0 10px 26px rgba(37, 99, 235, 0.2);
+
+
+
         filter: brightness(1.02);
+
+
+
       }
+
+
+
       @media (max-width: 640px) {
+
+
+
         .cta-group {
+
+
+
           grid-template-columns: 1fr;
+
+
+
         }
+
+
+
         .cta {
+
+
+
           align-items: center;
+
+
+
         }
+
+
+
       }
-    </style>
+
+
+
+      .cta-badge {
+
+        display: inline-flex;
+
+        align-items: center;
+
+        gap: 6px;
+
+        align-self: flex-start;
+
+        background: rgba(37, 99, 235, 0.12);
+
+        color: #1e3a8a;
+
+        border-radius: 999px;
+
+        padding: 4px 10px;
+
+        font-size: 0.72rem;
+
+        font-weight: 700;
+
+        letter-spacing: 0.02em;
+
+        text-transform: uppercase;
+
+        margin-bottom: 0;
+
+      }
+
+      .cta-badge-spacer {
+
+        height: 24px;
+
+        margin-bottom: 0;
+
+      }
+
+      .cta-full {
+
+
+
+        width: 100%;
+
+
+
+      }
+
+
+
+      .cta-meta-primary {
+
+
+
+        color: #1e3a8a;
+
+
+
+        font-weight: 700;
+
+
+
+      }
+
+
+
+      .cta-note {
+
+
+
+        margin: -2px 0 0;
+
+
+
+        color: #475569;
+
+
+
+        font-size: 0.9rem;
+
+
+
+        font-weight: 600;
+
+
+
+      }
+
+
+
+      .upsell-title {
+
+
+
+        font-size: 1.35rem;
+
+
+
+        margin-bottom: 10px;
+
+
+
+      }
+
+
+
+      .upsell-sub {
+
+
+
+        margin-bottom: 14px;
+
+
+
+      }
+
+
+
+      .upsell-footer {
+
+
+
+        margin-top: 14px;
+
+
+
+        text-align: center;
+
+
+
+        font-weight: 600;
+
+
+
+        color: #4b5563;
+
+
+
+      }
+
+
+
+</style>
+
+
+
   </head>
+
+
+
   <body>
+
+
+
     <main class="merci-container">
+
+
+
       <h1 class="merci-title">Merci, tout est bien reçu.</h1>
+
+
+
       <p class="merci-body">
+
+
+
         Nous avons enregistré toutes les informations nécessaires et la configuration de votre adresse email
+
+
+
         professionnelle va maintenant commencer.
+
+
+
       </p>
+
+
+
       <p class="merci-body">
+
+
+
         Nous procédons à la création du domaine, à la configuration technique (DNS, MX, SPF, DKIM) et à la mise en place
+
+
+
         complète de votre boîte email.
+
+
+
       </p>
+
+
+
       <p class="merci-body">
+
+
+
         Vous recevrez vos accès sécurisés à votre adresse email actuelle dans les prochaines 24 heures.
+
+
+
       </p>
+
+
+
+
+
+
 
       <hr />
 
-      <h2 class="merci-title" style="font-size: 1.3rem; margin-bottom: 10px;">
-        Besoin d’une autre adresse pour un collaborateur ou un autre projet ?
-      </h2>
-      <p class="merci-body">
-        Si vous souhaitez créer une seconde adresse email professionnelle (avec un autre domaine ou une autre
-        extension), choisissez simplement la formule qui vous convient ci-dessous.
+
+
+
+
+
+
+      <h2 class="merci-title upsell-title">Besoin d'une autre adresse pour un collaborateur ou un autre projet ?</h2>
+
+
+
+      <p class="merci-body upsell-sub">
+
+        Pour une seconde adresse email professionnelle (.fr ou .com), sélectionnez parmi nos offres au
+        <strong>tarif réduit</strong> ci-dessous.
+
       </p>
+
+
+
       <div class="cta-group">
-        <div>
+
+
+
+        <div class="cta-item">
+
+
+
+          <span class="cta-badge">Recommandé</span>
+
+
+
           <a
-            class="cta cta-secondary"
-            href="https://buy.stripe.com/7sY8wOdwp3364XP3Gb9MY08"
-            target="_blank"
-            rel="noreferrer"
-          >
-            Créer une adresse – Offre mensuelle
-          </a>
-          <p class="cta-meta secondary">
-            18 € de création + 7 € / mois<br />
-            Annulable à tout moment
-          </p>
-        </div>
-        <div>
-          <a
+
+
+
             class="cta cta-primary"
+
+
+
             href="https://buy.stripe.com/6oU00i4ZTdHK8a13Gb9MY0a"
+
+
+
             target="_blank"
+
+
+
             rel="noreferrer"
+
+
+
           >
-            Créer une adresse – Offre annuelle
+
+
+
+            Créer une adresse — Offre annuelle
+
+
+
           </a>
-          <p class="cta-meta">48 € TTC / an – tout inclus</p>
+
+
+
+          <p class="cta-meta cta-meta-primary">24 € TTC / an — tarif client</p>
+
+
+
+          <p class="cta-note">Tout inclus • Le plus simple</p>
+
+
+
         </div>
+
+
+
+        <div class="cta-item">
+
+
+
+          <span class="cta-badge-spacer" aria-hidden="true"></span>
+
+          <a
+
+
+
+            class="cta cta-secondary"
+
+
+
+            href="https://buy.stripe.com/7sY8wOdwp3364XP3Gb9MY08"
+
+
+
+            target="_blank"
+
+
+
+            rel="noreferrer"
+
+
+
+          >
+
+
+
+            Créer une adresse — Offre mensuelle
+
+
+
+          </a>
+
+
+
+          <p class="cta-meta">18 € de création + 5 € / mois</p>
+
+
+
+
+
+        </div>
+
+
+
       </div>
-      <p class="merci-body" style="margin-top: 12px; font-size: 0.95rem;">
-        Chaque adresse est configurée indépendamment, avec son propre domaine. Adresse prête sous 24h ou remboursée.
-      </p>
+
+
+
+      <p class="upsell-footer">Adresse prête sous 24h ou remboursée.</p>
+
+
+
+
+
+
+
     </main>
+
+
+
   </body>
+
+
+
 </html>
+
+
+
