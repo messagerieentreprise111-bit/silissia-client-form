@@ -36,7 +36,26 @@ let confirmedDomain = '';
 let isSubmitting = false;
 const localRegex = /^[a-z0-9-]{1,40}$/;
 const urlParams = new URLSearchParams(window.location.search);
-const sessionIdParam = urlParams.get('session_id') || '';
+const sessionStorageKey = 'stripe_session_id';
+let sessionIdParam = urlParams.get('session_id') || '';
+let sessionSource = sessionIdParam ? 'url' : 'unknown';
+if (sessionIdParam) {
+  try {
+    window.sessionStorage.setItem(sessionStorageKey, sessionIdParam);
+  } catch {
+    // ignore storage failures
+  }
+} else {
+  try {
+    const stored = window.sessionStorage.getItem(sessionStorageKey);
+    if (stored) {
+      sessionIdParam = stored;
+      sessionSource = 'sessionStorage';
+    }
+  } catch {
+    // ignore storage failures
+  }
+}
 const appConfig = window.APP_CONFIG || {};
 const disableCompletionGuard = Boolean(appConfig.disableCompletionGuard);
 const completionRetryMaxMs = 60000;
@@ -44,6 +63,15 @@ const completionRetryDelayMs = 4000;
 
 if (!disableCompletionGuard && !sessionIdParam) {
   window.location.href = '/acces-non-valide';
+}
+
+function clearSessionIdFromUrl() {
+  if (!window.history?.replaceState) return;
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has('session_id')) return;
+  url.searchParams.delete('session_id');
+  const clean = `${url.pathname}${url.searchParams.toString() ? `?${url.searchParams.toString()}` : ''}${url.hash}`;
+  window.history.replaceState({}, '', clean);
 }
 
 function setStatus(message, type = '') {
@@ -506,6 +534,7 @@ async function guardCompletedState() {
     try {
       const params = new URLSearchParams();
       if (sessionIdParam) params.set('session_id', sessionIdParam);
+      if (sessionSource && sessionSource !== 'unknown') params.set('source', sessionSource);
       const qs = params.toString();
       if (!qs) return;
       const response = await fetch(`${apiBase}/api/completion?${qs}`);
@@ -529,6 +558,7 @@ async function guardCompletedState() {
         window.location.href = '/acces-non-valide';
         return;
       }
+      clearSessionIdFromUrl();
       if (payload?.completed) {
         window.location.href = '/deja-complete';
       }

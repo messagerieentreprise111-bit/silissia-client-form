@@ -465,13 +465,61 @@ function redactSessionId(value) {
   return `${raw.slice(0, 8)}...${raw.slice(-4)}`;
 }
 
-function logSubscriptionDecision(sessionId, state, reason, details = {}) {
-  logger.info('stripe', 'Subscription validation decision', {
-    sessionId: redactSessionId(sessionId),
-    state,
+function redactStripeId(value) {
+  const raw = (value || '').trim();
+  if (!raw) return '(none)';
+  if (raw.length <= 10) return `${raw.slice(0, 5)}...`;
+  return `${raw.slice(0, 8)}...${raw.slice(-4)}`;
+}
+
+function normalizeDecisionSource(value) {
+  const raw = (value || '').toString().trim().toLowerCase();
+  if (raw === 'url') return 'url';
+  if (raw === 'sessionstorage' || raw === 'sessionStorage') return 'sessionStorage';
+  return 'unknown';
+}
+
+function logSubscriptionValidationDecision({
+  reason,
+  livemode,
+  source,
+  matchedPriceId,
+  allowedPriceIds,
+  lineItemPriceIds,
+  sessionSummary,
+  subscriptionSummary,
+  invoiceSummary,
+  paymentIntentSummary,
+  sessionId,
+  subscriptionId,
+  invoiceId,
+  paymentIntentId,
+  expectedYearlyPriceId,
+  receivedPriceId,
+}) {
+  const meta = {
     reason,
-    ...details,
-  });
+    livemode: typeof livemode === 'boolean' ? livemode : null,
+    source: normalizeDecisionSource(source),
+    matchedPriceId: matchedPriceId || null,
+    allowedPriceIds: allowedPriceIds || [],
+    lineItemPriceIds: lineItemPriceIds || [],
+    session: sessionSummary || {},
+    subscription: subscriptionSummary || {},
+    invoice: invoiceSummary || {},
+    payment_intent: paymentIntentSummary || {},
+    sessionId: redactSessionId(sessionId),
+    subscriptionId: redactStripeId(subscriptionId),
+    invoiceId: redactStripeId(invoiceId),
+    paymentIntentId: redactStripeId(paymentIntentId),
+  };
+
+  if (reason === 'no_allowed_price') {
+    meta.expected_yearly_price_id = redactStripeId(expectedYearlyPriceId);
+    meta.received_price_id = redactStripeId(receivedPriceId);
+  }
+
+  logger.info('stripe', 'Subscription validation decision', meta);
 }
 
 function getNextRetryDelayMs(attemptCount) {
@@ -1475,6 +1523,21 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
     });
   }
 
+  const paymentStatus = session.payment_status || null;
+  const sessionStatus = session.status || null;
+  const hasAllowedPrice = lineItemPriceIds.some((id) => expectedPriceIds.has(id));
+  const matchedPriceId = lineItemPriceIds.find((id) => expectedPriceIds.has(id)) || null;
+  const paymentOk = paymentStatus === 'paid' || sessionStatus === 'complete';
+  const allowedPriceIds = Array.from(expectedPriceIds);
+
+  let subscriptionStatus = null;
+  let subscriptionId = session.subscription || null;
+  let invoiceStatus = null;
+  let invoicePaid = null;
+  let invoiceId = null;
+  let paymentIntentStatus = null;
+  let paymentIntentId = null;
+
   const expectedLivemode = getExpectedStripeLivemode();
   if (expectedLivemode !== null && session.livemode !== expectedLivemode) {
     logger.warn('stripe', 'Stripe session livemode mismatch', {
@@ -1490,28 +1553,55 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       state: 'denied',
       reason: 'livemode_mismatch',
       priceIds: lineItemPriceIds,
+      decisionContext: {
+        allowedPriceIds,
+        lineItemPriceIds,
+        matchedPriceId,
+        session: {
+          payment_status: session.payment_status || '(none)',
+          status: session.status || '(none)',
+          mode: session.mode || '(none)',
+        },
+        subscription: { status: subscriptionStatus || '(none)' },
+        invoice: { status: invoiceStatus || '(none)', paid: invoicePaid },
+        payment_intent: { status: paymentIntentStatus || '(none)' },
+        subscriptionId,
+        invoiceId,
+        paymentIntentId,
+      },
     };
   }
 
-  const paymentStatus = session.payment_status || null;
-  const sessionStatus = session.status || null;
-  const hasAllowedPrice = lineItemPriceIds.some((id) => expectedPriceIds.has(id));
-  const paymentOk = paymentStatus === 'paid' || sessionStatus === 'complete';
-
   if (session.mode !== 'subscription') {
     if (!hasAllowedPrice) {
-      return {
-        found: true,
-        paid: false,
-        paymentStatus,
-        session,
-        state: 'denied',
-        reason: 'no_allowed_price',
-        priceIds: lineItemPriceIds,
-      };
-    }
-    if (paymentOk) {
-      const { subscriptionPriceId, billingPeriod } = getSubscriptionInfoFromPriceIds(lineItemPriceIds);
+    return {
+      found: true,
+      paid: false,
+      paymentStatus,
+      session,
+      state: 'denied',
+      reason: 'no_allowed_price',
+      priceIds: lineItemPriceIds,
+      decisionContext: {
+        allowedPriceIds,
+        lineItemPriceIds,
+        matchedPriceId,
+        session: {
+          payment_status: paymentStatus || '(none)',
+          status: sessionStatus || '(none)',
+          mode: session.mode || '(none)',
+        },
+        subscription: { status: subscriptionStatus || '(none)' },
+        invoice: { status: invoiceStatus || '(none)', paid: invoicePaid },
+        payment_intent: { status: paymentIntentStatus || '(none)' },
+        subscriptionId,
+        invoiceId,
+        paymentIntentId,
+      },
+    };
+  }
+  if (paymentOk) {
+    const { subscriptionPriceId, billingPeriod } = getSubscriptionInfoFromPriceIds(lineItemPriceIds);
       await upsertPaymentRecord({
         sessionId,
         paid: true,
@@ -1536,6 +1626,22 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
         session,
         state: 'paid',
         priceIds: lineItemPriceIds,
+        decisionContext: {
+          allowedPriceIds,
+          lineItemPriceIds,
+          matchedPriceId,
+          session: {
+            payment_status: paymentStatus || '(none)',
+            status: sessionStatus || '(none)',
+            mode: session.mode || '(none)',
+          },
+          subscription: { status: subscriptionStatus || '(none)' },
+          invoice: { status: invoiceStatus || '(none)', paid: invoicePaid },
+          payment_intent: { status: paymentIntentStatus || '(none)' },
+          subscriptionId,
+          invoiceId,
+          paymentIntentId,
+        },
       };
     }
     return {
@@ -1546,6 +1652,22 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       state: isPendingPaymentStatus(paymentStatus, sessionStatus) ? 'retry' : 'denied',
       reason: 'not_paid',
       priceIds: lineItemPriceIds,
+      decisionContext: {
+        allowedPriceIds,
+        lineItemPriceIds,
+        matchedPriceId,
+        session: {
+          payment_status: paymentStatus || '(none)',
+          status: sessionStatus || '(none)',
+          mode: session.mode || '(none)',
+        },
+        subscription: { status: subscriptionStatus || '(none)' },
+        invoice: { status: invoiceStatus || '(none)', paid: invoicePaid },
+        payment_intent: { status: paymentIntentStatus || '(none)' },
+        subscriptionId,
+        invoiceId,
+        paymentIntentId,
+      },
     };
   }
 
@@ -1575,14 +1697,26 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       session,
       state: 'paid',
       priceIds: lineItemPriceIds,
+      decisionContext: {
+        allowedPriceIds,
+        lineItemPriceIds,
+        matchedPriceId,
+        session: {
+          payment_status: paymentStatus || '(none)',
+          status: sessionStatus || '(none)',
+          mode: session.mode || '(none)',
+        },
+        subscription: { status: subscriptionStatus || '(none)' },
+        invoice: { status: invoiceStatus || '(none)', paid: invoicePaid },
+        payment_intent: { status: paymentIntentStatus || '(none)' },
+        subscriptionId,
+        invoiceId,
+        paymentIntentId,
+      },
     };
   }
 
   if (sessionStatus === 'expired') {
-    logSubscriptionDecision(sessionId, 'denied', 'session_expired', {
-      sessionStatus: sessionStatus || '(none)',
-      sessionPaymentStatus: paymentStatus || '(none)',
-    });
     return {
       found: true,
       paid: false,
@@ -1591,20 +1725,27 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       state: 'denied',
       reason: 'session_expired',
       priceIds: lineItemPriceIds,
+      decisionContext: {
+        allowedPriceIds,
+        lineItemPriceIds,
+        matchedPriceId,
+        session: {
+          payment_status: paymentStatus || '(none)',
+          status: sessionStatus || '(none)',
+          mode: session.mode || '(none)',
+        },
+        subscription: { status: subscriptionStatus || '(none)' },
+        invoice: { status: invoiceStatus || '(none)', paid: invoicePaid },
+        payment_intent: { status: paymentIntentStatus || '(none)' },
+        subscriptionId,
+        invoiceId,
+        paymentIntentId,
+      },
     };
   }
 
   const subscriptionId = session.subscription;
   if (!subscriptionId) {
-    logSubscriptionDecision(
-      sessionId,
-      isPendingPaymentStatus(paymentStatus, sessionStatus) ? 'retry' : 'denied',
-      paymentOk ? 'no_allowed_price' : 'subscription_not_active',
-      {
-        sessionStatus: sessionStatus || '(none)',
-        sessionPaymentStatus: paymentStatus || '(none)',
-      }
-    );
     return {
       found: true,
       paid: false,
@@ -1613,6 +1754,22 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       state: isPendingPaymentStatus(paymentStatus, sessionStatus) ? 'retry' : 'denied',
       reason: paymentOk ? 'no_allowed_price' : 'subscription_not_active',
       priceIds: lineItemPriceIds,
+      decisionContext: {
+        allowedPriceIds,
+        lineItemPriceIds,
+        matchedPriceId,
+        session: {
+          payment_status: paymentStatus || '(none)',
+          status: sessionStatus || '(none)',
+          mode: session.mode || '(none)',
+        },
+        subscription: { status: subscriptionStatus || '(none)' },
+        invoice: { status: invoiceStatus || '(none)', paid: invoicePaid },
+        payment_intent: { status: paymentIntentStatus || '(none)' },
+        subscriptionId,
+        invoiceId,
+        paymentIntentId,
+      },
     };
   }
 
@@ -1636,11 +1793,32 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       state: 'retry',
       reason: 'subscription_not_active',
       priceIds: lineItemPriceIds,
+      decisionContext: {
+        allowedPriceIds,
+        lineItemPriceIds,
+        matchedPriceId,
+        session: {
+          payment_status: paymentStatus || '(none)',
+          status: sessionStatus || '(none)',
+          mode: session.mode || '(none)',
+        },
+        subscription: { status: subscriptionStatus || '(none)' },
+        invoice: { status: invoiceStatus || '(none)', paid: invoicePaid },
+        payment_intent: { status: paymentIntentStatus || '(none)' },
+        subscriptionId,
+        invoiceId,
+        paymentIntentId,
+      },
     };
   }
 
   const invoice = subscription.latest_invoice || null;
-  const paymentIntentStatus = invoice?.payment_intent?.status || null;
+  subscriptionStatus = subscription.status || null;
+  invoiceStatus = invoice?.status || null;
+  invoicePaid = typeof invoice?.paid === 'boolean' ? invoice.paid : null;
+  invoiceId = invoice?.id || null;
+  paymentIntentStatus = invoice?.payment_intent?.status || null;
+  paymentIntentId = invoice?.payment_intent?.id || null;
   logger.info('stripe', 'Subscription invoice summary', {
     sessionId: redactSessionId(sessionId),
     subscriptionId: subscriptionId || '(none)',
@@ -1660,10 +1838,6 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
     allowedSubscriptionPriceIds.has(id)
   );
   if (!hasAllowedSubscriptionPrice) {
-    logSubscriptionDecision(sessionId, 'denied', 'no_allowed_price', {
-      subscriptionStatus: subscription.status || '(none)',
-      invoiceStatus: invoice?.status || '(none)',
-    });
     return {
       found: true,
       paid: false,
@@ -1672,16 +1846,28 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       state: 'denied',
       reason: 'no_allowed_price',
       priceIds: lineItemPriceIds,
+      decisionContext: {
+        allowedPriceIds,
+        lineItemPriceIds,
+        matchedPriceId,
+        session: {
+          payment_status: paymentStatus || '(none)',
+          status: sessionStatus || '(none)',
+          mode: session.mode || '(none)',
+        },
+        subscription: { status: subscriptionStatus || '(none)' },
+        invoice: { status: invoiceStatus || '(none)', paid: invoicePaid },
+        payment_intent: { status: paymentIntentStatus || '(none)' },
+        subscriptionId,
+        invoiceId,
+        paymentIntentId,
+      },
     };
   }
 
   if (subscription.status !== 'active') {
     const terminalStatuses = new Set(['canceled', 'incomplete_expired']);
     const state = terminalStatuses.has(subscription.status) ? 'denied' : 'retry';
-    logSubscriptionDecision(sessionId, state, 'subscription_not_active', {
-      subscriptionStatus: subscription.status || '(none)',
-      invoiceStatus: invoice?.status || '(none)',
-    });
     return {
       found: true,
       paid: false,
@@ -1690,15 +1876,32 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       state,
       reason: 'subscription_not_active',
       priceIds: lineItemPriceIds,
+      decisionContext: {
+        allowedPriceIds,
+        lineItemPriceIds,
+        matchedPriceId,
+        session: {
+          payment_status: paymentStatus || '(none)',
+          status: sessionStatus || '(none)',
+          mode: session.mode || '(none)',
+        },
+        subscription: { status: subscriptionStatus || '(none)' },
+        invoice: { status: invoiceStatus || '(none)', paid: invoicePaid },
+        payment_intent: { status: paymentIntentStatus || '(none)' },
+        subscriptionId,
+        invoiceId,
+        paymentIntentId,
+      },
     };
   }
 
-  const invoicePaid = Boolean(
+  const invoicePaidConfirmed = Boolean(
     invoice?.paid ||
       invoice?.status === 'paid' ||
       paymentIntentStatus === 'succeeded'
   );
-  if (!invoicePaid) {
+  invoicePaid = invoicePaidConfirmed;
+  if (!invoicePaidConfirmed) {
     const invoiceStatus = invoice?.status || '(none)';
     const pendingInvoiceStatuses = new Set(['open', 'draft', 'processing', 'requires_action']);
     const failedInvoiceStatuses = new Set(['uncollectible', 'void']);
@@ -1710,11 +1913,6 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       : pendingInvoiceStatuses.has(invoiceStatus)
       ? 'retry'
       : 'retry';
-    logSubscriptionDecision(sessionId, state, 'invoice_not_paid', {
-      subscriptionStatus: subscription.status || '(none)',
-      invoiceStatus,
-      paymentIntentStatus: paymentIntentStatus || '(none)',
-    });
     return {
       found: true,
       paid: false,
@@ -1723,6 +1921,22 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
       state,
       reason: 'invoice_not_paid',
       priceIds: lineItemPriceIds,
+      decisionContext: {
+        allowedPriceIds,
+        lineItemPriceIds,
+        matchedPriceId,
+        session: {
+          payment_status: paymentStatus || '(none)',
+          status: sessionStatus || '(none)',
+          mode: session.mode || '(none)',
+        },
+        subscription: { status: subscriptionStatus || '(none)' },
+        invoice: { status: invoiceStatus || '(none)', paid: invoicePaidConfirmed },
+        payment_intent: { status: paymentIntentStatus || '(none)' },
+        subscriptionId,
+        invoiceId,
+        paymentIntentId,
+      },
     };
   }
 
@@ -1752,12 +1966,31 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
     session,
     state: 'paid',
     priceIds: lineItemPriceIds,
+    decisionContext: {
+      allowedPriceIds,
+      lineItemPriceIds,
+      matchedPriceId,
+      session: {
+        payment_status: paymentStatus || '(none)',
+        status: sessionStatus || '(none)',
+        mode: session.mode || '(none)',
+      },
+      subscription: { status: subscriptionStatus || '(none)' },
+      invoice: { status: invoiceStatus || '(none)', paid: invoicePaid },
+      payment_intent: { status: paymentIntentStatus || '(none)' },
+      subscriptionId,
+      invoiceId,
+      paymentIntentId,
+    },
   };
 }
 
 app.get('/api/completion', async (req, res) => {
   const sessionId = (req.query.session_id || req.query.token || '').trim();
   const email = (req.query.email || '').trim().toLowerCase();
+  const source = normalizeDecisionSource(
+    req.query.source || (req.query.session_id ? 'url' : 'unknown')
+  );
 
   if (!DISABLE_COMPLETION_GUARD && !hasAccessContext({ sessionId, email })) {
     logger.warn('selection', 'Completion check denied: missing context', {
@@ -1780,6 +2013,37 @@ app.get('/api/completion', async (req, res) => {
           logContext: 'completion',
         })
       : null;
+    const decisionContext = stripeStatus?.decisionContext || {};
+    const decisionReason = stripeStatus?.paid
+      ? 'ok_paid'
+      : stripeStatus?.state === 'retry'
+      ? stripeStatus?.reason || 'retry_pending'
+      : stripeStatus?.reason || 'payment_failed';
+    logSubscriptionValidationDecision({
+      reason: decisionReason,
+      livemode: stripeStatus?.session?.livemode,
+      source,
+      matchedPriceId: decisionContext.matchedPriceId || null,
+      allowedPriceIds: decisionContext.allowedPriceIds || getExpectedPriceIds(),
+      lineItemPriceIds: decisionContext.lineItemPriceIds || [],
+      sessionSummary: decisionContext.session || {
+        payment_status: stripeStatus?.paymentStatus || '(none)',
+        status: stripeStatus?.session?.status || '(none)',
+        mode: stripeStatus?.session?.mode || '(none)',
+      },
+      subscriptionSummary: decisionContext.subscription || { status: '(none)' },
+      invoiceSummary: decisionContext.invoice || { status: '(none)', paid: null },
+      paymentIntentSummary: decisionContext.payment_intent || { status: '(none)' },
+      sessionId,
+      subscriptionId: decisionContext.subscriptionId || null,
+      invoiceId: decisionContext.invoiceId || null,
+      paymentIntentId: decisionContext.paymentIntentId || null,
+      expectedYearlyPriceId: STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY,
+      receivedPriceId:
+        decisionContext.matchedPriceId ||
+        (decisionContext.lineItemPriceIds && decisionContext.lineItemPriceIds[0]) ||
+        null,
+    });
     if (!DISABLE_COMPLETION_GUARD && stripeStatus && stripeStatus.state === 'retry') {
       logger.info('selection', 'Completion check pending, retry advised', {
         sessionId: redactSessionId(sessionId),
@@ -2129,6 +2393,12 @@ app.post('/webhook/stripe', async (req, res) => {
     ) {
       let session = event.data.object;
       session = await ensureStripeSessionWithLineItems(session.id, session);
+      const webhookLineItemPriceIds = (session?.line_items?.data || [])
+        .map((item) => item?.price?.id || null)
+        .filter(Boolean);
+      const webhookAllowedPriceIds = getExpectedPriceIds();
+      const webhookMatchedPriceId =
+        webhookLineItemPriceIds.find((id) => webhookAllowedPriceIds.includes(id)) || null;
       const validation = validateStripeSession(session);
       if (!validation.ok) {
         logger.warn('stripe', 'Webhook session validation failed', {
@@ -2136,6 +2406,33 @@ app.post('/webhook/stripe', async (req, res) => {
           type: event.type,
           reasons: validation.errors,
         });
+        if (session.mode === 'subscription') {
+          const reason = validation.errors.includes('price_mismatch')
+            ? 'no_allowed_price'
+            : 'payment_failed';
+          logSubscriptionValidationDecision({
+            reason,
+            livemode: session.livemode,
+            source: 'unknown',
+            matchedPriceId: webhookMatchedPriceId,
+            allowedPriceIds: webhookAllowedPriceIds,
+            lineItemPriceIds: webhookLineItemPriceIds,
+            sessionSummary: {
+              payment_status: session.payment_status || '(none)',
+              status: session.status || '(none)',
+              mode: session.mode || '(none)',
+            },
+            subscriptionSummary: { status: '(unknown)' },
+            invoiceSummary: { status: '(unknown)', paid: null },
+            paymentIntentSummary: { status: '(unknown)' },
+            sessionId: session.id,
+            subscriptionId: session.subscription || null,
+            invoiceId: null,
+            paymentIntentId: session.payment_intent || null,
+            expectedYearlyPriceId: STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY,
+            receivedPriceId: webhookLineItemPriceIds[0] || null,
+          });
+        }
         return res.json({ received: true, ignored: true });
       }
 
@@ -2172,6 +2469,30 @@ app.post('/webhook/stripe', async (req, res) => {
         paid,
         type: event.type,
       });
+      if (session.mode === 'subscription') {
+        logSubscriptionValidationDecision({
+          reason: paid ? 'ok_paid' : 'retry_pending',
+          livemode: session.livemode,
+          source: 'unknown',
+          matchedPriceId: webhookMatchedPriceId,
+          allowedPriceIds: webhookAllowedPriceIds,
+          lineItemPriceIds: webhookLineItemPriceIds,
+          sessionSummary: {
+            payment_status: session.payment_status || '(none)',
+            status: session.status || '(none)',
+            mode: session.mode || '(none)',
+          },
+          subscriptionSummary: { status: '(unknown)' },
+          invoiceSummary: { status: '(unknown)', paid: null },
+          paymentIntentSummary: { status: '(unknown)' },
+          sessionId: session.id,
+          subscriptionId: session.subscription || null,
+          invoiceId: null,
+          paymentIntentId: session.payment_intent || null,
+          expectedYearlyPriceId: STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY,
+          receivedPriceId: webhookLineItemPriceIds[0] || null,
+        });
+      }
     } else {
       logger.info('stripe', 'Webhook received (ignored type)', { type: event.type });
     }
