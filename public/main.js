@@ -59,7 +59,7 @@ if (sessionIdParam) {
 const appConfig = window.APP_CONFIG || {};
 const disableCompletionGuard = Boolean(appConfig.disableCompletionGuard);
 const completionRetryMaxMs = 60000;
-const completionRetryDelayMs = 4000;
+const completionRetryDelayMs = 2000;
 
 if (!disableCompletionGuard && !sessionIdParam) {
   window.location.href = '/acces-non-valide';
@@ -530,6 +530,7 @@ if (existingDomainRadios.length && existingDomainInfo) {
 async function guardCompletedState() {
   if (disableCompletionGuard || !sessionIdParam) return;
   const startedAt = Date.now();
+  let currentDelayMs = completionRetryDelayMs;
   const attempt = async () => {
     try {
       const params = new URLSearchParams();
@@ -538,6 +539,21 @@ async function guardCompletedState() {
       const qs = params.toString();
       if (!qs) return;
       const response = await fetch(`${apiBase}/api/completion?${qs}`);
+      if (response.status === 429) {
+        const elapsed = Date.now() - startedAt;
+        if (elapsed < completionRetryMaxMs) {
+          const retryAfter = Number(response.headers.get('Retry-After'));
+          const nextDelay = Number.isFinite(retryAfter)
+            ? Math.max(1000, retryAfter * 1000)
+            : Math.min(currentDelayMs * 2, 10000);
+          currentDelayMs = nextDelay;
+          setStatus('Validation du paiement en cours. Merci de patienter...', 'notice');
+          window.setTimeout(attempt, nextDelay);
+          return;
+        }
+        window.location.href = '/acces-non-valide';
+        return;
+      }
       if (!response.ok) {
         window.location.href = '/acces-non-valide';
         return;
@@ -547,7 +563,11 @@ async function guardCompletedState() {
         const elapsed = Date.now() - startedAt;
         if (elapsed < completionRetryMaxMs) {
           setStatus('Validation du paiement en cours. Merci de patienter...', 'notice');
-          const delay = Math.max(1000, Math.min(Number(payload.retryAfterMs) || completionRetryDelayMs, 8000));
+          const delay = Math.max(
+            1000,
+            Math.min(Number(payload.retryAfterMs) || completionRetryDelayMs, 8000)
+          );
+          currentDelayMs = delay;
           window.setTimeout(attempt, delay);
           return;
         }

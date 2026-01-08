@@ -163,6 +163,26 @@ const apiLimiter = rateLimit({
 });
 app.use('/api/', apiLimiter);
 
+const completionIpLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop de requetes. Merci de reessayer dans une minute.' },
+});
+
+const completionSessionLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const sessionId = (req.query.session_id || req.query.token || '').trim();
+    return `${req.ip || 'unknown'}:${sessionId || 'none'}`;
+  },
+  message: { error: 'Trop de requetes. Merci de reessayer dans une minute.' },
+});
+
 function getPublicBaseUrl(req) {
   const envUrl = (process.env.PUBLIC_BASE_URL || '').trim();
   if (envUrl) {
@@ -470,6 +490,49 @@ function redactStripeId(value) {
   if (!raw) return '(none)';
   if (raw.length <= 10) return `${raw.slice(0, 5)}...`;
   return `${raw.slice(0, 8)}...${raw.slice(-4)}`;
+}
+
+function isValidStripeSessionId(value) {
+  return /^cs_(live|test)_[A-Za-z0-9]+$/.test(value || '');
+}
+
+const completionCache = new Map();
+const completionInflight = new Map();
+const COMPLETION_CACHE_RETRY_MS = 2000;
+const COMPLETION_CACHE_TERMINAL_MS = 5 * 60 * 1000;
+
+function getCompletionCacheTtl(status) {
+  if (!status) return 0;
+  if (status.state === 'retry') return COMPLETION_CACHE_RETRY_MS;
+  if (status.reason === 'session_not_found') return COMPLETION_CACHE_RETRY_MS;
+  return COMPLETION_CACHE_TERMINAL_MS;
+}
+
+async function getCompletionStripeStatus(sessionId, options) {
+  if (!sessionId) return null;
+  const cached = completionCache.get(sessionId);
+  const now = Date.now();
+  if (cached && now < cached.nextCheckAt) {
+    return { ...cached.value, cacheHit: true };
+  }
+  if (completionInflight.has(sessionId)) {
+    return completionInflight.get(sessionId);
+  }
+  const fetchPromise = (async () => {
+    const status = await getStripeSessionStatusWithOptions(sessionId, options);
+    const ttl = getCompletionCacheTtl(status);
+    if (ttl > 0) {
+      completionCache.set(sessionId, {
+        value: status,
+        nextCheckAt: Date.now() + ttl,
+      });
+    }
+    return status;
+  })().finally(() => {
+    completionInflight.delete(sessionId);
+  });
+  completionInflight.set(sessionId, fetchPromise);
+  return fetchPromise;
 }
 
 function normalizeDecisionSource(value) {
@@ -1985,12 +2048,39 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
   };
 }
 
-app.get('/api/completion', async (req, res) => {
+app.get('/api/completion', completionIpLimiter, completionSessionLimiter, async (req, res) => {
   const sessionId = (req.query.session_id || req.query.token || '').trim();
   const email = (req.query.email || '').trim().toLowerCase();
   const source = normalizeDecisionSource(
     req.query.source || (req.query.session_id ? 'url' : 'unknown')
   );
+
+  if (sessionId && !isValidStripeSessionId(sessionId)) {
+    logger.warn('selection', 'Completion check denied: invalid session id', {
+      path: req.originalUrl,
+      sessionId: redactSessionId(sessionId),
+      email: email || '(none)',
+    });
+    logSubscriptionValidationDecision({
+      reason: 'invalid_session_id',
+      livemode: null,
+      source,
+      matchedPriceId: null,
+      allowedPriceIds: getExpectedPriceIds(),
+      lineItemPriceIds: [],
+      sessionSummary: { payment_status: '(none)', status: '(none)', mode: '(none)' },
+      subscriptionSummary: { status: '(none)' },
+      invoiceSummary: { status: '(none)', paid: null },
+      paymentIntentSummary: { status: '(none)' },
+      sessionId,
+      subscriptionId: null,
+      invoiceId: null,
+      paymentIntentId: null,
+      expectedYearlyPriceId: STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY,
+      receivedPriceId: null,
+    });
+    return res.status(400).json({ error: 'Acces non valide.' });
+  }
 
   if (!DISABLE_COMPLETION_GUARD && !hasAccessContext({ sessionId, email })) {
     logger.warn('selection', 'Completion check denied: missing context', {
@@ -2008,7 +2098,7 @@ app.get('/api/completion', async (req, res) => {
     });
     const { completed, key } = await isCompleted({ sessionId, email });
     const stripeStatus = sessionId
-      ? await getStripeSessionStatusWithOptions(sessionId, {
+      ? await getCompletionStripeStatus(sessionId, {
           forceFetch: true,
           logContext: 'completion',
         })
@@ -2055,7 +2145,7 @@ app.get('/api/completion', async (req, res) => {
         paymentStatus: stripeStatus?.paymentStatus || null,
         paid: false,
         state: 'retry',
-        retryAfterMs: 4000,
+        retryAfterMs: 2000,
       });
     }
     if (!DISABLE_COMPLETION_GUARD && !stripeStatus?.paid) {
