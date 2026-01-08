@@ -27,6 +27,8 @@ const OUTBOX_POLL_INTERVAL_MS = parseInt(process.env.OUTBOX_POLL_INTERVAL_MS || 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_SETUP_PRICE_ID = process.env.STRIPE_SETUP_PRICE_ID || '';
 const STRIPE_SUBSCRIPTION_PRICE_ID = process.env.STRIPE_SUBSCRIPTION_PRICE_ID || '';
+const STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY = process.env.STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY || '';
+const STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY = process.env.STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY || '';
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || '').trim();
 const stripe = STRIPE_SECRET_KEY
@@ -113,7 +115,12 @@ logger.info('process', 'Stripe config summary', {
   enabled: Boolean(stripe),
   hasSetupPrice: Boolean(STRIPE_SETUP_PRICE_ID),
   hasSubscriptionPrice: Boolean(STRIPE_SUBSCRIPTION_PRICE_ID),
+  hasSubscriptionMonthly: Boolean(STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY),
+  hasSubscriptionYearly: Boolean(STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY),
   webhookConfigured: Boolean(STRIPE_WEBHOOK_SECRET),
+});
+logger.info('stripe', 'Whitelist prices count', {
+  count: getExpectedPriceIds().length,
 });
 logger.info('process', 'Apps Script webhook config', {
   configured: Boolean(APPS_SCRIPT_WEBHOOK),
@@ -237,12 +244,20 @@ async function ensureDbSchema() {
       amount_total INTEGER,
       currency TEXT,
       customer_email TEXT,
+      subscription_price_id TEXT,
+      billing_period TEXT,
       source TEXT,
       livemode BOOLEAN,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`
   );
+  await dbQuery(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS subscription_price_id TEXT`);
+  await dbQuery(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS billing_period TEXT`);
+  logger.info('db', 'Schema ok', {
+    table: 'payments',
+    columns: ['subscription_price_id', 'billing_period'],
+  });
 
   await dbQuery(
     `CREATE TABLE IF NOT EXISTS stripe_events (
@@ -1106,7 +1121,58 @@ function getExpectedStripeLivemode() {
 }
 
 function getExpectedPriceIds() {
-  return [STRIPE_SETUP_PRICE_ID, STRIPE_SUBSCRIPTION_PRICE_ID].filter(Boolean);
+  return [
+    STRIPE_SETUP_PRICE_ID,
+    STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY,
+    STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY,
+    STRIPE_SUBSCRIPTION_PRICE_ID,
+  ].filter(Boolean);
+}
+
+function getAllowedSubscriptionPriceIds() {
+  return [
+    STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY,
+    STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY,
+    STRIPE_SUBSCRIPTION_PRICE_ID,
+  ].filter(Boolean);
+}
+
+function getSubscriptionInfoFromPriceIds(priceIds) {
+  const allowed = new Set(getExpectedPriceIds());
+  for (const priceId of priceIds || []) {
+    if (!priceId || !allowed.has(priceId)) continue;
+    if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY) {
+      logger.info('stripe', 'Price matched monthly', { priceId });
+      return { subscriptionPriceId: priceId, billingPeriod: 'monthly' };
+    }
+    if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY) {
+      logger.info('stripe', 'Price matched yearly', { priceId });
+      return { subscriptionPriceId: priceId, billingPeriod: 'yearly' };
+    }
+    logger.info('stripe', 'Price matched legacy', { priceId });
+    return { subscriptionPriceId: priceId, billingPeriod: 'legacy' };
+  }
+  return { subscriptionPriceId: null, billingPeriod: null };
+}
+
+function getSubscriptionInfoFromSession(session) {
+  const allowed = new Set(getExpectedPriceIds());
+  const lineItems = session?.line_items?.data || [];
+  for (const item of lineItems) {
+    const priceId = item?.price?.id || null;
+    if (!priceId || !allowed.has(priceId)) continue;
+    if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY) {
+      logger.info('stripe', 'Price matched monthly', { priceId });
+      return { subscriptionPriceId: priceId, billingPeriod: 'monthly' };
+    }
+    if (priceId === STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY) {
+      logger.info('stripe', 'Price matched yearly', { priceId });
+      return { subscriptionPriceId: priceId, billingPeriod: 'yearly' };
+    }
+    logger.info('stripe', 'Price matched legacy', { priceId });
+    return { subscriptionPriceId: priceId, billingPeriod: 'legacy' };
+  }
+  return { subscriptionPriceId: null, billingPeriod: null };
 }
 
 function validateStripeSession(session) {
@@ -1128,6 +1194,20 @@ function validateStripeSession(session) {
   }
 
   return { ok: errors.length === 0, errors };
+}
+
+function isPendingPaymentStatus(paymentStatus, sessionStatus) {
+  const pendingStatuses = new Set([
+    'processing',
+    'requires_action',
+    'requires_payment_method',
+    'unpaid',
+  ]);
+  const pendingSessionStatuses = new Set(['open']);
+  return (
+    (paymentStatus && pendingStatuses.has(paymentStatus)) ||
+    (sessionStatus && pendingSessionStatuses.has(sessionStatus))
+  );
 }
 
 async function ensureStripeSessionWithLineItems(sessionId, session) {
@@ -1155,19 +1235,23 @@ async function upsertPaymentRecord({
   amountTotal,
   currency,
   customerEmail,
+  subscriptionPriceId,
+  billingPeriod,
   source,
   livemode,
 }) {
   if (!dbReady || !sessionId) return;
   await dbQuery(
     `INSERT INTO payments
-      (session_id, paid, amount_total, currency, customer_email, source, livemode)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+      (session_id, paid, amount_total, currency, customer_email, subscription_price_id, billing_period, source, livemode)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (session_id) DO UPDATE SET
       paid = EXCLUDED.paid,
       amount_total = EXCLUDED.amount_total,
       currency = EXCLUDED.currency,
       customer_email = EXCLUDED.customer_email,
+      subscription_price_id = EXCLUDED.subscription_price_id,
+      billing_period = EXCLUDED.billing_period,
       source = EXCLUDED.source,
       livemode = EXCLUDED.livemode,
       updated_at = NOW()`,
@@ -1177,6 +1261,8 @@ async function upsertPaymentRecord({
       amountTotal || null,
       currency || null,
       customerEmail || null,
+      subscriptionPriceId || null,
+      billingPeriod || null,
       source || null,
       typeof livemode === 'boolean' ? livemode : null,
     ]
@@ -1303,39 +1389,117 @@ async function isCompleted({ sessionId, email }) {
 }
 
 async function getStripeSessionStatus(sessionId) {
+  return getStripeSessionStatusWithOptions(sessionId);
+}
+
+async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
+  const { forceFetch = false, logContext = '' } = options;
   if (!stripe || !sessionId) {
-    return { found: false, paid: false, paymentStatus: null };
+    return { found: false, paid: false, paymentStatus: null, state: 'denied', reason: 'session_not_found' };
   }
 
-  if (dbReady) {
+  const expectedPriceIds = new Set(getExpectedPriceIds());
+  if (dbReady && !forceFetch) {
     const existing = await dbQuery('SELECT * FROM payments WHERE session_id = $1', [sessionId]);
     const payment = existing.rows[0];
     if (payment?.paid) {
-      return { found: true, paid: true, paymentStatus: 'paid', session: null };
+      if (payment.subscription_price_id && expectedPriceIds.has(payment.subscription_price_id)) {
+        return { found: true, paid: true, paymentStatus: 'paid', session: null, state: 'paid' };
+      }
+      logger.warn('stripe', 'Cached payment missing allowed price, forcing Stripe fetch', {
+        sessionId,
+        priceId: payment.subscription_price_id || '(none)',
+      });
     }
   }
 
+  let session;
   try {
-    const session = await stripe.checkout.sessions.retrieve(sessionId, {
-      expand: ['line_items.data.price'],
+    session = await stripe.checkout.sessions.retrieve(sessionId);
+  } catch (error) {
+    logger.error('stripe', 'Stripe session lookup failed', {
+      sessionId,
+      message: error.message || error,
+      type: error?.type,
     });
-    const validation = validateStripeSession(session);
-    if (!validation.ok) {
-      logger.warn('stripe', 'Stripe session validation failed', {
-        sessionId,
-        reasons: validation.errors,
-      });
-      return { found: true, paid: false, paymentStatus: 'invalid', session };
-    }
+    return { found: false, paid: false, paymentStatus: null, state: 'denied', reason: 'session_not_found' };
+  }
 
-    const paid = session.payment_status === 'paid' || session.status === 'complete';
-    if (paid) {
+  let lineItemPriceIds = [];
+  try {
+    const lineItems = await stripe.checkout.sessions.listLineItems(sessionId, { limit: 100 });
+    lineItemPriceIds = (lineItems?.data || [])
+      .map((item) => item?.price?.id || null)
+      .filter(Boolean);
+  } catch (error) {
+    logger.warn('stripe', 'Stripe line items lookup failed', {
+      sessionId,
+      message: error.message || error,
+      type: error?.type,
+    });
+  }
+
+  const sessionSummary = {
+    mode: session.mode || '(none)',
+    paymentStatus: session.payment_status || '(none)',
+    status: session.status || '(none)',
+    hasSubscription: Boolean(session.subscription),
+    priceIds: lineItemPriceIds,
+  };
+
+  if (logContext) {
+    logger.info('stripe', 'Completion session summary', {
+      sessionId,
+      context: logContext,
+      ...sessionSummary,
+    });
+  }
+
+  const expectedLivemode = getExpectedStripeLivemode();
+  if (expectedLivemode !== null && session.livemode !== expectedLivemode) {
+    logger.warn('stripe', 'Stripe session livemode mismatch', {
+      sessionId,
+      expectedLivemode,
+      livemode: session.livemode,
+    });
+    return {
+      found: true,
+      paid: false,
+      paymentStatus: session.payment_status || session.status || null,
+      session,
+      state: 'denied',
+      reason: 'livemode_mismatch',
+      priceIds: lineItemPriceIds,
+    };
+  }
+
+  const paymentStatus = session.payment_status || null;
+  const sessionStatus = session.status || null;
+  const hasAllowedPrice = lineItemPriceIds.some((id) => expectedPriceIds.has(id));
+  const paymentOk = paymentStatus === 'paid' || sessionStatus === 'complete';
+
+  if (session.mode !== 'subscription') {
+    if (!hasAllowedPrice) {
+      return {
+        found: true,
+        paid: false,
+        paymentStatus,
+        session,
+        state: 'denied',
+        reason: 'no_allowed_price',
+        priceIds: lineItemPriceIds,
+      };
+    }
+    if (paymentOk) {
+      const { subscriptionPriceId, billingPeriod } = getSubscriptionInfoFromPriceIds(lineItemPriceIds);
       await upsertPaymentRecord({
         sessionId,
         paid: true,
         amountTotal: session.amount_total || null,
         currency: session.currency || null,
         customerEmail: session.customer_details?.email || session.customer_email || null,
+        subscriptionPriceId,
+        billingPeriod,
         source: 'fallback_api',
         livemode: session.livemode,
       });
@@ -1345,22 +1509,165 @@ async function getStripeSessionStatus(sessionId) {
         paymentIntent: session.payment_intent || null,
         customerEmail: session.customer_details?.email || session.customer_email || null,
       });
+      return {
+        found: true,
+        paid: true,
+        paymentStatus,
+        session,
+        state: 'paid',
+        priceIds: lineItemPriceIds,
+      };
     }
-
     return {
       found: true,
-      paid,
-      paymentStatus: session.payment_status || session.status || null,
+      paid: false,
+      paymentStatus,
       session,
+      state: isPendingPaymentStatus(paymentStatus, sessionStatus) ? 'retry' : 'denied',
+      reason: 'not_paid',
+      priceIds: lineItemPriceIds,
     };
-  } catch (error) {
-    logger.error('stripe', 'Stripe session lookup failed', {
+  }
+
+  if (paymentOk && hasAllowedPrice) {
+    const { subscriptionPriceId, billingPeriod } = getSubscriptionInfoFromPriceIds(lineItemPriceIds);
+    await upsertPaymentRecord({
       sessionId,
+      paid: true,
+      amountTotal: session.amount_total || null,
+      currency: session.currency || null,
+      customerEmail: session.customer_details?.email || session.customer_email || null,
+      subscriptionPriceId,
+      billingPeriod,
+      source: 'fallback_api',
+      livemode: session.livemode,
+    });
+    await upsertPaymentStatus({
+      sessionId,
+      paymentStatus: session.payment_status || session.status || null,
+      paymentIntent: session.payment_intent || null,
+      customerEmail: session.customer_details?.email || session.customer_email || null,
+    });
+    return {
+      found: true,
+      paid: true,
+      paymentStatus,
+      session,
+      state: 'paid',
+      priceIds: lineItemPriceIds,
+    };
+  }
+
+  const subscriptionId = session.subscription;
+  if (!subscriptionId) {
+    return {
+      found: true,
+      paid: false,
+      paymentStatus,
+      session,
+      state: isPendingPaymentStatus(paymentStatus, sessionStatus) ? 'retry' : 'denied',
+      reason: paymentOk ? 'no_allowed_price' : 'subscription_not_active',
+      priceIds: lineItemPriceIds,
+    };
+  }
+
+  let subscription;
+  try {
+    subscription = await stripe.subscriptions.retrieve(subscriptionId, {
+      expand: ['items.data.price', 'latest_invoice.payment_intent'],
+    });
+  } catch (error) {
+    logger.warn('stripe', 'Stripe subscription lookup failed', {
+      sessionId,
+      subscriptionId,
       message: error.message || error,
       type: error?.type,
     });
-    return { found: false, paid: false, paymentStatus: null };
+    return {
+      found: true,
+      paid: false,
+      paymentStatus,
+      session,
+      state: 'retry',
+      reason: 'subscription_not_active',
+      priceIds: lineItemPriceIds,
+    };
   }
+
+  const allowedSubscriptionPriceIds = new Set(getAllowedSubscriptionPriceIds());
+  const subscriptionPriceIds = (subscription.items?.data || [])
+    .map((item) => item?.price?.id || null)
+    .filter(Boolean);
+  const hasAllowedSubscriptionPrice = subscriptionPriceIds.some((id) =>
+    allowedSubscriptionPriceIds.has(id)
+  );
+  if (!hasAllowedSubscriptionPrice) {
+    return {
+      found: true,
+      paid: false,
+      paymentStatus,
+      session,
+      state: 'denied',
+      reason: 'no_allowed_price',
+      priceIds: lineItemPriceIds,
+    };
+  }
+
+  if (subscription.status !== 'active') {
+    return {
+      found: true,
+      paid: false,
+      paymentStatus,
+      session,
+      state: 'denied',
+      reason: 'subscription_not_active',
+      priceIds: lineItemPriceIds,
+    };
+  }
+
+  const invoice = subscription.latest_invoice || null;
+  const invoicePaid = Boolean(invoice?.paid || invoice?.status === 'paid');
+  if (!invoicePaid) {
+    const invoiceStatus = invoice?.status || invoice?.payment_intent?.status || '(none)';
+    const pendingInvoiceStatuses = new Set(['open', 'draft', 'processing', 'requires_action']);
+    return {
+      found: true,
+      paid: false,
+      paymentStatus,
+      session,
+      state: pendingInvoiceStatuses.has(invoiceStatus) ? 'retry' : 'denied',
+      reason: 'invoice_not_paid',
+      priceIds: lineItemPriceIds,
+    };
+  }
+
+  const { subscriptionPriceId, billingPeriod } = getSubscriptionInfoFromPriceIds(subscriptionPriceIds);
+  await upsertPaymentRecord({
+    sessionId,
+    paid: true,
+    amountTotal: session.amount_total || null,
+    currency: session.currency || null,
+    customerEmail: session.customer_details?.email || session.customer_email || null,
+    subscriptionPriceId,
+    billingPeriod,
+    source: 'fallback_api',
+    livemode: session.livemode,
+  });
+  await upsertPaymentStatus({
+    sessionId,
+    paymentStatus: session.payment_status || session.status || null,
+    paymentIntent: session.payment_intent || null,
+    customerEmail: session.customer_details?.email || session.customer_email || null,
+  });
+
+  return {
+    found: true,
+    paid: true,
+    paymentStatus,
+    session,
+    state: 'paid',
+    priceIds: lineItemPriceIds,
+  };
 }
 
 app.get('/api/completion', async (req, res) => {
@@ -1377,13 +1684,37 @@ app.get('/api/completion', async (req, res) => {
   }
 
   try {
+    logger.info('stripe', 'Completion check received', {
+      sessionId: sessionId || '(none)',
+      path: req.originalUrl,
+    });
     const { completed, key } = await isCompleted({ sessionId, email });
-    const stripeStatus = sessionId ? await getStripeSessionStatus(sessionId) : null;
+    const stripeStatus = sessionId
+      ? await getStripeSessionStatusWithOptions(sessionId, {
+          forceFetch: true,
+          logContext: 'completion',
+        })
+      : null;
+    if (!DISABLE_COMPLETION_GUARD && stripeStatus && stripeStatus.state === 'retry') {
+      logger.info('selection', 'Completion check pending, retry advised', {
+        sessionId: sessionId || '(none)',
+        paymentStatus: stripeStatus?.paymentStatus || '(none)',
+        reason: stripeStatus?.reason || '(none)',
+      });
+      return res.json({
+        completed,
+        paymentStatus: stripeStatus?.paymentStatus || null,
+        paid: false,
+        state: 'retry',
+        retryAfterMs: 4000,
+      });
+    }
     if (!DISABLE_COMPLETION_GUARD && !stripeStatus?.paid) {
       logger.warn('selection', 'Completion check denied: unpaid session', {
         sessionId: sessionId || '(none)',
         email: email || '(none)',
         paymentStatus: stripeStatus?.paymentStatus || '(none)',
+        reason: stripeStatus?.reason || '(none)',
       });
       return res.status(402).json({ error: 'Paiement requis.' });
     }
@@ -1729,12 +2060,15 @@ app.post('/webhook/stripe', async (req, res) => {
         event.type === 'checkout.session.async_payment_succeeded';
 
       if (paid) {
+        const { subscriptionPriceId, billingPeriod } = getSubscriptionInfoFromSession(session);
         await upsertPaymentRecord({
           sessionId: session.id,
           paid: true,
           amountTotal: session.amount_total || null,
           currency: session.currency || null,
           customerEmail: session.customer_details?.email || session.customer_email || null,
+          subscriptionPriceId,
+          billingPeriod,
           source: 'webhook',
           livemode: session.livemode,
         });

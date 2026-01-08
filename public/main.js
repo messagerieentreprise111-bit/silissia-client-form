@@ -39,6 +39,8 @@ const urlParams = new URLSearchParams(window.location.search);
 const sessionIdParam = urlParams.get('session_id') || '';
 const appConfig = window.APP_CONFIG || {};
 const disableCompletionGuard = Boolean(appConfig.disableCompletionGuard);
+const completionRetryMaxMs = 60000;
+const completionRetryDelayMs = 4000;
 
 if (!disableCompletionGuard && !sessionIdParam) {
   window.location.href = '/acces-non-valide';
@@ -499,27 +501,42 @@ if (existingDomainRadios.length && existingDomainInfo) {
 
 async function guardCompletedState() {
   if (disableCompletionGuard || !sessionIdParam) return;
-  try {
-    const params = new URLSearchParams();
-    if (sessionIdParam) params.set('session_id', sessionIdParam);
-    const qs = params.toString();
-    if (!qs) return;
-    const response = await fetch(`${apiBase}/api/completion?${qs}`);
-    if (!response.ok) {
-      window.location.href = '/acces-non-valide';
-      return;
+  const startedAt = Date.now();
+  const attempt = async () => {
+    try {
+      const params = new URLSearchParams();
+      if (sessionIdParam) params.set('session_id', sessionIdParam);
+      const qs = params.toString();
+      if (!qs) return;
+      const response = await fetch(`${apiBase}/api/completion?${qs}`);
+      if (!response.ok) {
+        window.location.href = '/acces-non-valide';
+        return;
+      }
+      const payload = await response.json();
+      if (payload?.state === 'retry') {
+        const elapsed = Date.now() - startedAt;
+        if (elapsed < completionRetryMaxMs) {
+          setStatus('Validation du paiement en cours. Merci de patienter...', 'notice');
+          const delay = Math.max(1000, Math.min(Number(payload.retryAfterMs) || completionRetryDelayMs, 8000));
+          window.setTimeout(attempt, delay);
+          return;
+        }
+        window.location.href = '/acces-non-valide';
+        return;
+      }
+      if (!payload?.paid) {
+        window.location.href = '/acces-non-valide';
+        return;
+      }
+      if (payload?.completed) {
+        window.location.href = '/deja-complete';
+      }
+    } catch {
+      // ignore check failures
     }
-    const payload = await response.json();
-    if (!payload?.paid) {
-      window.location.href = '/acces-non-valide';
-      return;
-    }
-    if (payload?.completed) {
-      window.location.href = '/deja-complete';
-    }
-  } catch {
-    // ignore check failures
-  }
+  };
+  attempt();
 }
 
 guardCompletedState();
