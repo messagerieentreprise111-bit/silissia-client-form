@@ -1744,7 +1744,7 @@ async function getStripeSessionStatusWithOptions(sessionId, options = {}) {
     };
   }
 
-  const subscriptionId = session.subscription;
+  subscriptionId = session.subscription || null;
   if (!subscriptionId) {
     return {
       found: true,
