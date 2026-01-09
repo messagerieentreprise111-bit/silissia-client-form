@@ -183,7 +183,11 @@ const completionSessionLimiter = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req) => {
     const sessionId = (req.query.session_id || req.query.token || '').trim();
-    return `${req.ip || 'unknown'}:${sessionId || 'none'}`;
+    const ip =
+      typeof rateLimit.ipKeyGenerator === 'function'
+        ? rateLimit.ipKeyGenerator(req)
+        : req.ip || 'unknown';
+    return `${ip}:${sessionId || 'none'}`;
   },
   message: { error: 'Trop de requetes. Merci de reessayer dans une minute.' },
 });
