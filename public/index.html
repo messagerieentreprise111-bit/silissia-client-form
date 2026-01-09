@@ -17,26 +17,29 @@
       </section>
 
       <form id="domain-form" class="form-grid">
+        <p class="required-note">
+          Les champs marqués d’un <span class="required-asterisk">*</span> sont obligatoires.
+        </p>
         <section class="card">
           <h2>Informations de base</h2>
           <div class="form-stack">
-            <label for="fullName">Prénom et nom</label>
+            <label for="fullName">Prénom et nom <span class="required-asterisk">*</span></label>
             <input id="fullName" name="fullName" type="text" required />
             <p class="field-error" id="fullName-error"></p>
           </div>
           <div class="form-stack">
-            <label for="company">Nom de l'entreprise</label>
+            <label for="company">Nom de l'entreprise <span class="required-asterisk">*</span></label>
             <input id="company" name="company" type="text" required />
             <p class="field-error" id="company-error"></p>
           </div>
           <div class="form-stack">
-            <label for="currentEmail">Adresse email actuelle</label>
+            <label for="currentEmail">Adresse email actuelle <span class="required-asterisk">*</span></label>
             <input id="currentEmail" name="currentEmail" type="email" required />
             <small>Cette adresse sera utilisée pour vous envoyer vos accès.</small>
             <p class="field-error" id="currentEmail-error"></p>
           </div>
           <div class="form-stack">
-            <label for="currentEmailConfirm">Confirmez votre adresse email</label>
+            <label for="currentEmailConfirm">Confirmez votre adresse email <span class="required-asterisk">*</span></label>
             <input id="currentEmailConfirm" name="currentEmailConfirm" type="email" required />
             <small>Saisissez à nouveau votre adresse email.</small>
             <p class="field-error" id="currentEmailConfirm-error"></p>
@@ -48,7 +51,7 @@
             </legend>
             <div class="fieldset-title">
               Disposez-vous déjà d'un nom de domaine ou d'une adresse email professionnelle active pour votre
-              entreprise ?
+              entreprise ? <span class="required-asterisk">*</span>
             </div>
             <label>
               <input type="radio" name="hasExistingDomain" value="no" required />
@@ -58,6 +61,7 @@
               <input type="radio" name="hasExistingDomain" value="yes" required />
               Oui, un domaine ou une adresse existe déjà
             </label>
+            <p class="field-error" id="existingDomain-error"></p>
           </fieldset>
           <p id="existingDomainInfo" style="display: none;">
             Comme indiqué avant l'achat, cette offre n'inclut pas la reprise, la modification ou la migration de
@@ -72,7 +76,7 @@
         </section>
 
         <section class="card">
-          <h2>Nom affiché</h2>
+          <h2>Nom affiché <span class="required-asterisk">*</span></h2>
           <p class="helper">Ce nom apparaîtra comme expéditeur lorsque vous enverrez des mails.</p>
           <div class="form-stack">
             <input
@@ -89,9 +93,9 @@
         </section>
 
         <section class="card">
-          <h1>Choisissez le début de votre adresse mail professionnelle</h1>
+          <h1>Choisissez le début de votre adresse mail professionnelle <span class="required-asterisk">*</span></h1>
           <div class="form-stack">
-            <label for="local-part" class="label">Début de l'adresse :</label>
+            <label for="local-part" class="label">Début de l'adresse : <span class="required-asterisk">*</span></label>
             <input
               type="text"
               id="local-part"
@@ -109,7 +113,7 @@
         </section>
 
         <section class="card">
-          <h2>Choisissez votre nom de domaine</h2>
+          <h2>Choisissez votre nom de domaine <span class="required-asterisk">*</span></h2>
           <p class="subtitle">
             Tapez un nom de domaine pour vérifier sa disponibilité puis sélectionnez celui qui vous convient.
           </p>

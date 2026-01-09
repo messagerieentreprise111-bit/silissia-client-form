@@ -24,6 +24,7 @@ const APPS_SCRIPT_WEBHOOK = process.env.APPS_SCRIPT_WEBHOOK || '';
 const NOTIFICATION_TIMEOUT_MS = 8000;
 const APPS_SCRIPT_TIMEOUT_MS = parseInt(process.env.APPS_SCRIPT_TIMEOUT_MS || '12000', 10);
 const OUTBOX_POLL_INTERVAL_MS = parseInt(process.env.OUTBOX_POLL_INTERVAL_MS || '60000', 10);
+const DOMAIN_CHECK_TIMEOUT_MS = parseInt(process.env.DOMAIN_CHECK_TIMEOUT_MS || '8000', 10);
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_SETUP_PRICE_ID = process.env.STRIPE_SETUP_PRICE_ID || '';
 const STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY = process.env.STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY || '';
@@ -241,15 +242,28 @@ function generateVariants(domain) {
 }
 
 async function checkAvailability(domain) {
-  const response = await fetch(
-    `https://api.domainr.com/v2/status?domain=${encodeURIComponent(domain)}`,
-    {
-      headers: {
-        'Fastly-Key': FASTLY_API_TOKEN,
-        Accept: 'application/json',
-      },
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DOMAIN_CHECK_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(
+      `https://api.domainr.com/v2/status?domain=${encodeURIComponent(domain)}`,
+      {
+        headers: {
+          'Fastly-Key': FASTLY_API_TOKEN,
+          Accept: 'application/json',
+        },
+        signal: controller.signal,
+      }
+    );
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error('Domain check timed out');
     }
-  );
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!response.ok) {
     throw new Error(`Domain check failed with status ${response.status}`);
@@ -1207,7 +1221,11 @@ app.get('/api/check', async (req, res) => {
 
   logger.info('domain-check', 'Domain availability check started', { domain: normalized });
   try {
-    const checkResult = await checkAvailability(normalized);
+    const checkResult = await withTimeout(
+      checkAvailability(normalized),
+      DOMAIN_CHECK_TIMEOUT_MS,
+      'Domain check'
+    );
 
     if (checkResult.available) {
       logger.info('domain-check', 'Domain available', {
@@ -1225,11 +1243,15 @@ app.get('/api/check', async (req, res) => {
     const variantCandidates = generateVariants(normalized);
     const availabilityChecks = await Promise.all(
       variantCandidates.map(async (candidate) => {
-        try {
-          const candidateResult = await checkAvailability(candidate);
-          return candidateResult.available
-            ? { domain: candidate, status: candidateResult.status }
-            : null;
+          try {
+            const candidateResult = await withTimeout(
+              checkAvailability(candidate),
+              DOMAIN_CHECK_TIMEOUT_MS,
+              'Domain check'
+            );
+            return candidateResult.available
+              ? { domain: candidate, status: candidateResult.status }
+              : null;
         } catch {
           return null;
         }

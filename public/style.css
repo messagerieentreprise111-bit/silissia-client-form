@@ -125,6 +125,17 @@ body::before {
   gap: 18px;
 }
 
+.required-note {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--muted);
+}
+
+.required-asterisk {
+  color: #dc2626;
+  font-weight: 700;
+}
+
 h1 {
   margin: 0 0 10px;
   font-size: 1.7rem;
@@ -171,6 +182,12 @@ fieldset {
   padding: 18px 16px 14px;
   background: #f4f7ff;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+
+fieldset.fieldset-error {
+  border-color: #ef4444;
+  background: #fef2f2;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6), 0 0 0 2px rgba(239, 68, 68, 0.18);
 }
 
 legend {

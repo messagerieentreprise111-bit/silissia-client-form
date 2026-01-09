@@ -12,6 +12,8 @@ const checkButton = document.getElementById('check-button');
 const chosenDomainInput = document.getElementById('chosenDomain');
 const existingDomainRadios = document.querySelectorAll('input[name="hasExistingDomain"]');
 const existingDomainInfo = document.getElementById('existingDomainInfo');
+const existingDomainFieldset = existingDomainInfo?.closest('fieldset') || null;
+const existingDomainError = document.getElementById('existingDomain-error');
 const confirmationSection = document.getElementById('confirmation');
 const selectionPreview = document.getElementById('selection-preview');
 const selectionError = document.getElementById('selection-error');
@@ -60,6 +62,9 @@ const appConfig = window.APP_CONFIG || {};
 const disableCompletionGuard = Boolean(appConfig.disableCompletionGuard);
 const completionRetryMaxMs = 60000;
 const completionRetryDelayMs = 2000;
+const domainCheckTimeoutMs = 10000;
+const domainInputRegex = /^[a-z0-9-]+\.[a-z]{2,24}$/;
+const allowedDomainTlds = new Set(['fr', 'com']);
 
 if (!disableCompletionGuard && !sessionIdParam) {
   window.location.href = '/acces-non-valide';
@@ -103,9 +108,20 @@ function showLocalError(message) {
   localError.textContent = message || '';
 }
 
+function showDomainError(message) {
+  if (!domainUnavailable) return;
+  domainUnavailable.textContent = message || '';
+  domainUnavailable.style.display = message ? 'block' : 'none';
+}
+
 function setInputError(inputEl, hasError) {
   if (!inputEl) return;
   inputEl.classList.toggle('input-error', Boolean(hasError));
+}
+
+function setFieldsetError(fieldsetEl, hasError) {
+  if (!fieldsetEl) return;
+  fieldsetEl.classList.toggle('fieldset-error', Boolean(hasError));
 }
 
 let currentEmailTouched = false;
@@ -185,7 +201,7 @@ function validateLocalInput(showMessage = false) {
   if (value.length > 40) {
     if (showMessage) {
       showLocalError(
-        'Maximum 40 caractères. Utilisez uniquement lettres, chiffres ou tirets (sans accents : é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç).'
+        "Maximum 40 caractères. Utilisez uniquement lettres, chiffres ou tirets (sans espaces ni apostrophes, sans accents : é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç)."
       );
     }
     return false;
@@ -194,13 +210,38 @@ function validateLocalInput(showMessage = false) {
   if (!localRegex.test(value)) {
     if (showMessage) {
       showLocalError(
-        'Début d’adresse invalide. Lettres, chiffres ou tirets uniquement. Pas d’accents (é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç).'
+        "Début d’adresse invalide. Lettres, chiffres ou tirets uniquement. Pas d’espaces, pas d’apostrophes, pas d’accents (é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç)."
       );
     }
     return false;
   }
 
   if (showMessage) showLocalError('');
+  return true;
+}
+
+function validateDomainInput(showMessage = false) {
+  const value = input.value.trim().toLowerCase();
+  if (!value) {
+    if (showMessage) showDomainError('Indiquez un nom de domaine à vérifier.');
+    return false;
+  }
+  if (!domainInputRegex.test(value)) {
+    if (showMessage) {
+      showDomainError(
+        "Nom de domaine invalide. Utilisez uniquement des lettres, chiffres ou tirets (sans espaces, sans apostrophes, sans accents, ex : monentreprise.fr)."
+      );
+    }
+    return false;
+  }
+  const tld = value.split('.').pop();
+  if (!allowedDomainTlds.has(tld)) {
+    if (showMessage) {
+      showDomainError('Terminaison non autorisée. Utilisez uniquement .fr ou .com.');
+    }
+    return false;
+  }
+  if (showMessage) showDomainError('');
   return true;
 }
 
@@ -310,8 +351,18 @@ function ensureFormComplete() {
 
   if (!Array.from(existingDomainRadios || []).some((r) => r.checked)) {
     ok = false;
+    setFieldsetError(existingDomainFieldset, true);
+    if (existingDomainError) {
+      existingDomainError.textContent =
+        'Indiquez si un domaine ou une adresse email pro existe déjà.';
+    }
     if (!firstInvalid && existingDomainInfo) {
-      firstInvalid = existingDomainInfo.closest('fieldset') || existingDomainInfo;
+      firstInvalid = existingDomainFieldset || existingDomainInfo;
+    }
+  } else {
+    setFieldsetError(existingDomainFieldset, false);
+    if (existingDomainError) {
+      existingDomainError.textContent = '';
     }
   }
 
@@ -341,7 +392,7 @@ async function handleDomainCheck() {
   }
   if (!validateLocalInput(true)) {
     setStatus(
-      'Début d’adresse invalide. 1 à 40 caractères, uniquement lettres, chiffres ou tirets, sans accents (é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç).',
+      "Début d’adresse invalide. 1 à 40 caractères, uniquement lettres, chiffres ou tirets, sans espaces, sans apostrophes, sans accents (é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç).",
       'error'
     );
     return;
@@ -350,7 +401,10 @@ async function handleDomainCheck() {
     setStatus('Requête bloquée.', 'error');
     return;
   }
-  if (!domain) return;
+  if (!validateDomainInput(true)) {
+    setStatus('Merci de corriger le nom de domaine avant de vérifier.', 'error');
+    return;
+  }
 
   clearResults();
   resetSelectionState();
@@ -358,7 +412,16 @@ async function handleDomainCheck() {
   checkButton.disabled = true;
 
   try {
-    const response = await fetch(`${apiBase}/api/check?domain=${encodeURIComponent(domain)}`);
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), domainCheckTimeoutMs);
+    let response;
+    try {
+      response = await fetch(`${apiBase}/api/check?domain=${encodeURIComponent(domain)}`, {
+        signal: controller.signal,
+      });
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
     const payload = await response.json();
 
     if (!response.ok) {
@@ -368,11 +431,20 @@ async function handleDomainCheck() {
     setStatus('');
     renderResults(payload);
   } catch (error) {
+    if (error?.name === 'AbortError') {
+      setStatus(
+        'La vérification prend trop de temps. Merci de réessayer dans quelques instants. Si le problème persiste, contactez contact@silissia.com.',
+        'error'
+      );
+      return;
+    }
     const friendly =
       error.message === 'Failed to fetch'
-        ? 'Impossible de contacter le serveur. Vérifie que "npm start" tourne toujours.'
+        ? 'Impossible de vérifier le domaine pour le moment. Merci de réessayer. Si le problème persiste, contactez contact@silissia.com.'
         : error.message?.toLowerCase().includes('nom de domaine invalide')
-        ? 'Nom de domaine invalide.\nUtilisez uniquement une terminaison autorisée (.fr ou .com) et des lettres, chiffres ou tirets.\nPas d’espaces, pas d’accents (é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç), pas de caractères spéciaux (!, ?, %, &, /, _).'
+        ? 'Nom de domaine invalide.\nUtilisez uniquement une terminaison autorisée (.fr ou .com) et des lettres, chiffres ou tirets.\nPas d’espaces, pas d’apostrophes, pas d’accents (é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç), pas de caractères spéciaux (!, ?, %, &, /, _).'
+        : error.message?.toLowerCase().includes('timed out')
+        ? 'La vérification a pris trop de temps. Merci de réessayer. Si le problème persiste, contactez contact@silissia.com.'
         : error.message;
     setStatus(friendly || 'Impossible de vérifier le domaine.', 'error');
   } finally {
@@ -408,7 +480,7 @@ async function submitSelection() {
 
   if (!validateLocalInput(true)) {
     setStatus(
-      'Début d’adresse invalide. 1 à 40 caractères, uniquement lettres, chiffres ou tirets, sans accents (é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç).',
+      "Début d’adresse invalide. 1 à 40 caractères, uniquement lettres, chiffres ou tirets, sans espaces, sans apostrophes, sans accents (é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç).",
       'error'
     );
     return;
@@ -476,6 +548,7 @@ localInput.addEventListener('input', () => {
 
 input.addEventListener('input', () => {
   resetSelectionState();
+  showDomainError('');
   updatePreview();
 });
 
@@ -514,6 +587,10 @@ if (sessionInput && sessionIdParam) {
 if (existingDomainRadios.length && existingDomainInfo) {
   existingDomainRadios.forEach((r) => {
     r.addEventListener('change', () => {
+      setFieldsetError(existingDomainFieldset, false);
+      if (existingDomainError) {
+        existingDomainError.textContent = '';
+      }
       if (r.value === 'yes') {
         existingDomainInfo.style.display = 'block';
       } else {
