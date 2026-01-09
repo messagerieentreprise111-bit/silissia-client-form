@@ -719,7 +719,9 @@ async function attemptOutboxSend(submissionId, reason = 'auto') {
     }
 
     const attemptCount = (entry.attemptCount || 0) + 1;
-    const payload = { ...entry.payload, submissionId };
+    const basePayload = entry.payload && typeof entry.payload === 'object' ? entry.payload : {};
+    const payload = { ...basePayload, submissionId };
+    const payloadKeys = Object.keys(payload).sort();
     const attemptStartedAt = new Date().toISOString();
 
     logger.info('apps-script', 'Apps Script webhook attempt', {
@@ -727,6 +729,7 @@ async function attemptOutboxSend(submissionId, reason = 'auto') {
       attemptCount,
       reason,
       timeoutMs: APPS_SCRIPT_TIMEOUT_MS,
+      payloadKeys,
     });
 
     let response;
@@ -763,6 +766,8 @@ async function attemptOutboxSend(submissionId, reason = 'auto') {
         attemptCount,
         status: response?.status || null,
         error: error.message || error,
+        responseBody: responseText || '(empty)',
+        payloadKeys,
         nextRetryAt,
       });
       return;
@@ -781,6 +786,7 @@ async function attemptOutboxSend(submissionId, reason = 'auto') {
       attemptCount,
       status: response?.status || null,
       body: responseText || '(empty)',
+      payloadKeys,
     });
   } finally {
     outboxInFlight.delete(submissionId);

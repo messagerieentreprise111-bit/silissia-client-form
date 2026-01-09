@@ -279,6 +279,7 @@ async function postWithTimeout(url, payload, timeoutMs) {
         `Webhook responded with status ${response.status} ${response.statusText}: ${bodyText || '(empty)'}`
       );
       error.status = response.status;
+      error.bodyText = bodyText;
       throw error;
     }
     return { status: response.status, bodyText };
@@ -385,6 +386,17 @@ function logRunSummary(summary) {
     message: 'Outbox replay summary',
     timestamp: new Date().toISOString(),
     meta: summary,
+  };
+  console.log(JSON.stringify(payload));
+}
+
+function logAppsScriptEvent(level, message, meta) {
+  const payload = {
+    level,
+    scope: 'apps-script',
+    message,
+    timestamp: new Date().toISOString(),
+    meta,
   };
   console.log(JSON.stringify(payload));
 }
@@ -515,9 +527,29 @@ async function main() {
       }
 
       for (const entry of batch) {
+        const basePayload = entry.payload && typeof entry.payload === 'object' ? entry.payload : {};
+        const submissionId =
+          basePayload.submissionId ||
+          basePayload.submission_id ||
+          basePayload.submissionID ||
+          basePayload.id ||
+          entry.submission_id ||
+          null;
+        const payload = { ...basePayload, submissionId };
+        const payloadKeys = Object.keys(payload).sort();
         try {
-          await postWithTimeout(APPS_SCRIPT_WEBHOOK, entry.payload, APPS_SCRIPT_TIMEOUT_MS);
-          await markOutboxResult(pool, entry, { success: true, status: 200 });
+          logAppsScriptEvent('info', 'Apps Script webhook attempt', {
+            submissionId,
+            payloadKeys,
+          });
+          const result = await postWithTimeout(APPS_SCRIPT_WEBHOOK, payload, APPS_SCRIPT_TIMEOUT_MS);
+          await markOutboxResult(pool, entry, { success: true, status: result.status });
+          logAppsScriptEvent('info', 'Apps Script webhook success', {
+            submissionId,
+            payloadKeys,
+            status: result.status,
+            body: result.bodyText || '(empty)',
+          });
           sentCount += 1;
           console.log(`Sent: ${entry.submission_id}`);
         } catch (error) {
@@ -532,6 +564,13 @@ async function main() {
             success: false,
             status: error.status || null,
             errorMessage: error.message || String(error),
+          });
+          logAppsScriptEvent('error', 'Apps Script webhook failed', {
+            submissionId,
+            payloadKeys,
+            status: error.status || null,
+            body: error.bodyText || '(empty)',
+            error: error.message || String(error),
           });
           console.error(`Failed: ${entry.submission_id} -> ${error.message || error}`);
         }
