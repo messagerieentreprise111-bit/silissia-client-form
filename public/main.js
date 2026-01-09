@@ -372,7 +372,7 @@ async function handleDomainCheck() {
       error.message === 'Failed to fetch'
         ? 'Impossible de contacter le serveur. Vérifie que "npm start" tourne toujours.'
         : error.message?.toLowerCase().includes('nom de domaine invalide')
-        ? 'Nom de domaine invalide.\nVérifiez qu’il contient une terminaison comme .fr ou .com et qu’il utilise uniquement des lettres, chiffres ou tirets.\nPas d’espaces, pas d’accents (é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç), pas de caractères spéciaux (!, ?, %, &, /, _).'
+        ? 'Nom de domaine invalide.\nUtilisez uniquement une terminaison autorisée (.fr ou .com) et des lettres, chiffres ou tirets.\nPas d’espaces, pas d’accents (é, è, ê, ë, à, â, ä, ù, ü, û, ô, ö, î, ï, ç), pas de caractères spéciaux (!, ?, %, &, /, _).'
         : error.message;
     setStatus(friendly || 'Impossible de vérifier le domaine.', 'error');
   } finally {
