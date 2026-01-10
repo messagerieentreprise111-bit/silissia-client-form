@@ -4,6 +4,11 @@ const nodemailer = require('nodemailer');
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const APPS_SCRIPT_WEBHOOK = process.env.APPS_SCRIPT_WEBHOOK || '';
 const APPS_SCRIPT_TIMEOUT_MS = parseInt(process.env.APPS_SCRIPT_TIMEOUT_MS || '12000', 10);
+const META_CAPI_MODE = (process.env.META_CAPI_MODE || 'off').trim().toLowerCase();
+const META_PIXEL_ID = (process.env.META_PIXEL_ID || '').trim();
+const META_CAPI_TOKEN = (process.env.META_CAPI_TOKEN || '').trim();
+const META_CAPI_TIMEOUT_MS = parseInt(process.env.META_CAPI_TIMEOUT_MS || '5000', 10);
+const META_TEST_EVENT_CODE = (process.env.META_TEST_EVENT_CODE || '').trim();
 const OUTBOX_BATCH_SIZE = parseInt(process.env.OUTBOX_BATCH_SIZE || '20', 10);
 const OUTBOX_MAX_ATTEMPTS = parseInt(process.env.OUTBOX_MAX_ATTEMPTS || '5', 10);
 const DATABASE_SSL = process.env.DATABASE_SSL || '';
@@ -67,6 +72,13 @@ function getNextRetryDelayMs(attemptCount) {
   const index = Math.max(0, attemptCount - 1);
   const minutes = minutesByAttempt[index] ?? minutesByAttempt[minutesByAttempt.length - 1];
   return minutes * 60 * 1000;
+}
+
+function normalizeMetaMode(mode) {
+  const value = (mode || 'off').trim().toLowerCase();
+  if (value === 'live') return 'live';
+  if (value === 'dry_run' || value === 'dry-run') return 'dry_run';
+  return 'off';
 }
 
 function createMailer() {
@@ -288,13 +300,44 @@ async function postWithTimeout(url, payload, timeoutMs) {
   }
 }
 
-async function fetchBatch(client) {
+async function postMetaCapiEvent(eventPayload, mode) {
+  const url = new URL(`https://graph.facebook.com/v18.0/${META_PIXEL_ID}/events`);
+  url.searchParams.set('access_token', META_CAPI_TOKEN);
+  if (mode === 'dry_run' && META_TEST_EVENT_CODE) {
+    url.searchParams.set('test_event_code', META_TEST_EVENT_CODE);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), META_CAPI_TIMEOUT_MS);
+  try {
+    const response = await fetch(url.toString(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: [eventPayload] }),
+      signal: controller.signal,
+    });
+    const bodyText = await response.text().catch(() => '');
+    if (!response.ok) {
+      const error = new Error(
+        `Meta CAPI responded with ${response.status} ${response.statusText}: ${bodyText || '(empty)'}`
+      );
+      error.status = response.status;
+      error.bodyText = bodyText;
+      throw error;
+    }
+    return { status: response.status, bodyText };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchAppsScriptBatch(client) {
   await client.query('BEGIN');
   try {
     const result = await client.query(
       `SELECT submission_id, payload, attempt_count
        FROM outbox
        WHERE sheet_status = 'pending'
+         AND (payload->>'destination' IS NULL OR payload->>'destination' = 'apps_script')
          AND (next_retry_at IS NULL OR next_retry_at <= NOW())
        ORDER BY next_retry_at NULLS FIRST, created_at ASC
        LIMIT $1
@@ -314,7 +357,49 @@ async function fetchBatch(client) {
        SET sheet_status = 'processing',
            last_attempt_at = NOW(),
            updated_at = NOW()
-       WHERE submission_id = ANY($1::text[])`,
+       WHERE submission_id = ANY($1::text[])
+         AND sheet_status = 'pending'
+         AND (payload->>'destination' IS NULL OR payload->>'destination' = 'apps_script')`,
+      [ids]
+    );
+    await client.query('COMMIT');
+    return rows;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  }
+}
+
+async function fetchMetaBatch(client) {
+  await client.query('BEGIN');
+  try {
+    const result = await client.query(
+      `SELECT submission_id, payload, attempt_count
+       FROM outbox
+       WHERE sheet_status = 'meta_pending'
+         AND payload->>'destination' = 'meta_capi'
+         AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+       ORDER BY next_retry_at NULLS FIRST, created_at ASC
+       LIMIT $1
+       FOR UPDATE SKIP LOCKED`,
+      [OUTBOX_BATCH_SIZE]
+    );
+
+    const rows = result.rows || [];
+    if (!rows.length) {
+      await client.query('COMMIT');
+      return [];
+    }
+
+    const ids = rows.map((row) => row.submission_id);
+    await client.query(
+      `UPDATE outbox
+       SET sheet_status = 'processing',
+           last_attempt_at = NOW(),
+           updated_at = NOW()
+       WHERE submission_id = ANY($1::text[])
+         AND sheet_status = 'meta_pending'
+         AND payload->>'destination' = 'meta_capi'`,
       [ids]
     );
     await client.query('COMMIT');
@@ -446,6 +531,74 @@ async function markOutboxResult(pool, entry, outcome) {
   );
 }
 
+async function markMetaResult(pool, entry, outcome) {
+  const attemptCount = (entry.attempt_count || 0) + 1;
+  if (outcome.success) {
+    await pool.query(
+      `UPDATE outbox
+       SET sheet_status = 'sent',
+           last_error = NULL,
+           attempt_count = $2,
+           next_retry_at = NULL,
+           updated_at = NOW(),
+           last_attempt_at = NOW(),
+           last_http_status = $3
+       WHERE submission_id = $1`,
+      [entry.submission_id, attemptCount, outcome.status || null]
+    );
+    return;
+  }
+
+  if (outcome.deferMinutes) {
+    const nextRetryAt = new Date(Date.now() + outcome.deferMinutes * 60 * 1000).toISOString();
+    await pool.query(
+      `UPDATE outbox
+       SET sheet_status = 'meta_pending',
+           last_error = $2,
+           attempt_count = $3,
+           next_retry_at = $4,
+           updated_at = NOW(),
+           last_attempt_at = NOW(),
+           last_http_status = $5
+       WHERE submission_id = $1`,
+      [
+        entry.submission_id,
+        outcome.errorMessage || 'Deferred',
+        attemptCount,
+        nextRetryAt,
+        outcome.status || null,
+      ]
+    );
+    return;
+  }
+
+  const shouldRetry = attemptCount < OUTBOX_MAX_ATTEMPTS && !outcome.forceDead;
+  const nextRetryAt = shouldRetry
+    ? new Date(Date.now() + getNextRetryDelayMs(attemptCount)).toISOString()
+    : null;
+  const status = shouldRetry ? 'meta_pending' : 'dead';
+
+  await pool.query(
+    `UPDATE outbox
+     SET sheet_status = $2,
+         last_error = $3,
+         attempt_count = $4,
+         next_retry_at = $5,
+         updated_at = NOW(),
+         last_attempt_at = NOW(),
+         last_http_status = $6
+     WHERE submission_id = $1`,
+    [
+      entry.submission_id,
+      status,
+      outcome.errorMessage || 'Unknown error',
+      attemptCount,
+      nextRetryAt,
+      outcome.status || null,
+    ]
+  );
+}
+
 async function main() {
   if (!DATABASE_URL) {
     console.error('DATABASE_URL missing. Aborting replay.');
@@ -455,6 +608,8 @@ async function main() {
     console.error('APPS_SCRIPT_WEBHOOK missing. Aborting replay.');
     process.exit(1);
   }
+
+  const metaMode = normalizeMetaMode(META_CAPI_MODE);
 
   const pool = new Pool({
     connectionString: DATABASE_URL,
@@ -516,7 +671,7 @@ async function main() {
     if (!OUTBOX_MONITOR_ONLY) {
       const client = await pool.connect();
       try {
-        batch = await fetchBatch(client);
+        batch = await fetchAppsScriptBatch(client);
       } finally {
         client.release();
       }
@@ -573,6 +728,143 @@ async function main() {
             error: error.message || String(error),
           });
           console.error(`Failed: ${entry.submission_id} -> ${error.message || error}`);
+        }
+      }
+    }
+
+    if (!OUTBOX_MONITOR_ONLY) {
+      const client = await pool.connect();
+      let metaBatch = [];
+      try {
+        metaBatch = await fetchMetaBatch(client);
+      } finally {
+        client.release();
+      }
+      for (const entry of metaBatch) {
+        const basePayload = entry.payload && typeof entry.payload === 'object' ? entry.payload : {};
+        const submissionId = entry.submission_id || null;
+        const sessionId = basePayload.checkout_session_id || basePayload.event?.event_id || null;
+        const eventId = basePayload.event?.event_id || null;
+        const status = entry.sheet_status || 'processing';
+
+        console.log(
+          JSON.stringify({
+            tag: 'META_SEND_ATTEMPT',
+            submissionId,
+            sessionId,
+            eventId,
+            status,
+          })
+        );
+
+        if (metaMode === 'off') {
+          await markMetaResult(pool, entry, {
+            success: false,
+            status: null,
+            errorMessage: 'Meta CAPI disabled',
+            deferMinutes: 60,
+          });
+          console.log(
+            JSON.stringify({
+              tag: 'META_SEND_FAIL',
+              submissionId,
+              sessionId,
+              eventId,
+              status: 'off',
+            })
+          );
+          continue;
+        }
+
+        if (metaMode === 'dry_run' && !META_TEST_EVENT_CODE) {
+          await markMetaResult(pool, entry, {
+            success: false,
+            status: null,
+            errorMessage: 'META_TEST_EVENT_CODE missing',
+            deferMinutes: 60,
+          });
+          console.log(
+            JSON.stringify({
+              tag: 'META_SEND_FAIL',
+              submissionId,
+              sessionId,
+              eventId,
+              status: 'test_event_code_missing',
+            })
+          );
+          continue;
+        }
+
+        if (metaMode === 'live' && (!META_PIXEL_ID || !META_CAPI_TOKEN)) {
+          await markMetaResult(pool, entry, {
+            success: false,
+            status: null,
+            errorMessage: 'META_PIXEL_ID or META_CAPI_TOKEN missing',
+            deferMinutes: 60,
+          });
+          console.log(
+            JSON.stringify({
+              tag: 'META_SEND_FAIL',
+              submissionId,
+              sessionId,
+              eventId,
+              status: 'config_missing',
+            })
+          );
+          continue;
+        }
+
+        if (!basePayload.event) {
+          await markMetaResult(pool, entry, {
+            success: false,
+            status: null,
+            errorMessage: 'Meta payload missing',
+          });
+          console.log(
+            JSON.stringify({
+              tag: 'META_SEND_FAIL',
+              submissionId,
+              sessionId,
+              eventId,
+              status: 'payload_missing',
+            })
+          );
+          continue;
+        }
+
+        try {
+          const result = await postMetaCapiEvent(basePayload.event, metaMode);
+          await markMetaResult(pool, entry, { success: true, status: result.status });
+          console.log(
+            JSON.stringify({
+              tag: 'META_SEND_OK',
+              submissionId,
+              sessionId,
+              eventId,
+              status: result.status,
+            })
+          );
+        } catch (error) {
+          const httpStatus = error.status || null;
+          const isRetryable =
+            httpStatus === 429 || httpStatus === null || (httpStatus >= 500 && httpStatus < 600);
+          const forceDead =
+            !isRetryable && (httpStatus === 400 || httpStatus === 401 || httpStatus === 403);
+          await markMetaResult(pool, entry, {
+            success: false,
+            status: httpStatus,
+            errorMessage: error.message || String(error),
+            forceDead,
+          });
+          console.log(
+            JSON.stringify({
+              tag: 'META_SEND_FAIL',
+              submissionId,
+              sessionId,
+              eventId,
+              status: httpStatus,
+            })
+          );
         }
       }
     }
