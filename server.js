@@ -12,6 +12,11 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const FASTLY_API_TOKEN = process.env.FASTLY_API_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL || '';
+const BOOT_VERSION =
+  process.env.RENDER_GIT_COMMIT ||
+  process.env.SOURCE_VERSION ||
+  process.env.COMMIT_SHA ||
+  null;
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || '';
 const SMTP_HOST = process.env.SMTP_HOST;
 const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
@@ -38,6 +43,17 @@ const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || '').trim();
 const stripe = STRIPE_SECRET_KEY
   ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' })
   : null;
+
+console.log(
+  JSON.stringify({
+    tag: 'BOOT_DEBUG',
+    version: BOOT_VERSION,
+    META_CAPI_MODE: process.env.META_CAPI_MODE || null,
+    META_PIXEL_ID_set: Boolean((process.env.META_PIXEL_ID || '').trim()),
+    META_CAPI_TOKEN_set: Boolean((process.env.META_CAPI_TOKEN || '').trim()),
+    META_TEST_EVENT_CODE_set: Boolean((process.env.META_TEST_EVENT_CODE || '').trim()),
+  })
+);
 
 if (!FASTLY_API_TOKEN) {
   logger.error('process', 'Missing FASTLY_API_TOKEN in environment', { hasToken: Boolean(FASTLY_API_TOKEN) });
@@ -406,6 +422,11 @@ async function initDb() {
   try {
     await dbPool.query('SELECT 1');
     await ensureDbSchema();
+    try {
+      await logSchemaFlags();
+    } catch (error) {
+      logger.warn('db', 'SCHEMA_FLAGS log failed', { message: error.message || error });
+    }
     dbReady = true;
     logger.info('db', 'DB connected', { url: redactDbUrl(DATABASE_URL) });
   } catch (error) {
@@ -473,6 +494,19 @@ function redactDbUrl(value) {
   }
 }
 
+function getDbFingerprint(value) {
+  if (!value) return '(none)';
+  try {
+    const url = new URL(value);
+    const dbName = (url.pathname || '').replace(/^\/+/, '');
+    const host = url.hostname || '(unknown)';
+    const port = url.port || '';
+    return `${host}${port ? `:${port}` : ''}/${dbName || '(unknown)'}`;
+  } catch {
+    return '(invalid)';
+  }
+}
+
 function getDbSslConfig() {
   if (process.env.DATABASE_SSL === 'true') {
     return { rejectUnauthorized: false };
@@ -494,6 +528,61 @@ async function dbQuery(text, params) {
     throw new Error('DB pool not initialized');
   }
   return dbPool.query(text, params);
+}
+
+async function getTableExists(tableName) {
+  const result = await dbQuery('SELECT to_regclass($1) AS reg', [`public.${tableName}`]);
+  return Boolean(result.rows[0]?.reg);
+}
+
+async function getTableHasColumn(tableName, columnName) {
+  const result = await dbQuery(
+    `SELECT 1
+     FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = $1
+       AND column_name = $2
+     LIMIT 1`,
+    [tableName, columnName]
+  );
+  return result.rows.length > 0;
+}
+
+async function isColumnUnique(tableName, columnName) {
+  const result = await dbQuery(
+    `SELECT i.indisunique,
+            i.indisprimary,
+            array_agg(a.attname ORDER BY x.ordinality) AS cols
+     FROM pg_index i
+     JOIN pg_class c ON c.oid = i.indrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS x(attnum, ordinality) ON true
+     JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = x.attnum
+     WHERE c.relname = $1 AND n.nspname = 'public'
+     GROUP BY i.indisunique, i.indisprimary`,
+    [tableName]
+  );
+  return result.rows.some((row) => {
+    const cols = row.cols || [];
+    return (row.indisunique || row.indisprimary) && cols.length === 1 && cols[0] === columnName;
+  });
+}
+
+async function logSchemaFlags() {
+  const outboxExists = await getTableExists('outbox');
+  const outboxHasId = outboxExists && (await getTableHasColumn('outbox', 'id'));
+  const outboxSubmissionIdUnique =
+    outboxExists && (await isColumnUnique('outbox', 'submission_id'));
+  const metaOutboxExists = await getTableExists('meta_outbox');
+
+  console.log(
+    JSON.stringify({
+      tag: 'SCHEMA_FLAGS',
+      OUTBOX_HAS_ID: outboxHasId,
+      OUTBOX_SUBMISSION_ID_UNIQUE: outboxSubmissionIdUnique,
+      META_OUTBOX_EXISTS: metaOutboxExists,
+    })
+  );
 }
 
 function generateSubmissionId(sessionId) {
@@ -706,7 +795,9 @@ async function addOutboxEntry(entry) {
     if (!dbReady) {
       throw new Error('DB not ready');
     }
-    await dbQuery(
+    const createdAt = entry.createdAt || new Date().toISOString();
+    const updatedAt = entry.updatedAt || createdAt;
+    const result = await dbQuery(
       `INSERT INTO outbox
         (submission_id, payload, sheet_status, last_error, attempt_count, next_retry_at, created_at, updated_at, last_attempt_at, last_http_status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -718,12 +809,30 @@ async function addOutboxEntry(entry) {
         entry.lastError || null,
         entry.attemptCount || 0,
         entry.nextRetryAt || null,
-        entry.createdAt || new Date().toISOString(),
-        entry.updatedAt || new Date().toISOString(),
+        createdAt,
+        updatedAt,
         entry.lastAttemptAt || null,
         entry.lastHttpStatus || null,
       ]
     );
+    if (result.rowCount > 0) {
+      console.log(
+        JSON.stringify({
+          tag: 'OUTBOX_INSERTED',
+          submissionId: entry.submissionId || null,
+          status: entry.sheetStatus || 'pending',
+          timestampISO: new Date().toISOString(),
+        })
+      );
+    } else {
+      console.log(
+        JSON.stringify({
+          tag: 'OUTBOX_SKIPPED',
+          submissionId: entry.submissionId || null,
+          reason: 'conflict',
+        })
+      );
+    }
     return entry;
   });
 }
@@ -2562,6 +2671,19 @@ app.post('/webhook/stripe', async (req, res) => {
     return res.status(400).send(`Webhook Error: ${error.message}`);
   }
 
+  console.log(
+    JSON.stringify({
+      tag: 'WEBHOOK_IN',
+      eventId: event?.id || null,
+      eventType: event?.type || null,
+      livemode: typeof event?.livemode === 'boolean' ? event.livemode : null,
+      requestPath: req.originalUrl,
+      method: req.method,
+      timestampISO: new Date().toISOString(),
+      dbFingerprint: getDbFingerprint(DATABASE_URL),
+    })
+  );
+
   const details = extractStripeEventDetails(event, null);
   const recorded = await insertStripeEvent({
     ...details,
@@ -2704,6 +2826,15 @@ app.post('/webhook/stripe', async (req, res) => {
       type: error?.type,
       eventType: event?.type,
     });
+    console.log(
+      JSON.stringify({
+        tag: 'WEBHOOK_ERROR',
+        eventId: event?.id || null,
+        eventType: event?.type || null,
+        message: error.message || String(error),
+        stack: error?.stack || null,
+      })
+    );
     await updateStripeEventStatus({
       eventId: recorded.eventId,
       status: 'error',
