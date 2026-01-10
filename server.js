@@ -833,7 +833,7 @@ async function addOutboxEntry(entry) {
         })
       );
     }
-    return entry;
+    return { ...entry, inserted: result.rowCount > 0 };
   });
 }
 
@@ -2807,11 +2807,44 @@ app.post('/webhook/stripe', async (req, res) => {
           paymentIntent: session.payment_intent || null,
           customerEmail: session.customer_details?.email || session.customer_email || null,
         });
+        const submissionId = session.id;
+        const eventTime =
+          typeof event?.created === 'number'
+            ? event.created
+            : typeof session?.created === 'number'
+            ? session.created
+            : Math.floor(Date.now() / 1000);
+        const payload = {
+          destination: 'meta_capi',
+          event: {
+            event_name: 'Purchase',
+            event_time: eventTime,
+            action_source: 'website',
+            event_id: session.id,
+            custom_data: {
+              value: typeof session.amount_total === 'number' ? session.amount_total / 100 : undefined,
+              currency: (session.currency || '').toUpperCase() || undefined,
+            },
+          },
+          checkout_session_id: session.id,
+        };
+        const inserted = await addOutboxEntry({
+          submissionId,
+          payload,
+          sheetStatus: 'meta_pending',
+          lastError: null,
+          attemptCount: 0,
+          nextRetryAt: null,
+        });
         console.log(
           JSON.stringify({
-            tag: 'META_ENQUEUE_SKIP',
-            ...enqueueContext,
-            reason: 'enqueue_not_configured',
+            tag: 'META_ENQUEUE_RESULT',
+            queued: Boolean(inserted?.inserted),
+            reason: inserted?.inserted ? null : 'conflict',
+            eventId: event?.id || null,
+            sessionId: session?.id || null,
+            submissionId,
+            destination: payload.destination,
           })
         );
       } else {
