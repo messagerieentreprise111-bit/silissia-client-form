@@ -2690,6 +2690,14 @@ app.post('/webhook/stripe', async (req, res) => {
     status: 'processed',
     httpStatus: 200,
   });
+  console.log(
+    JSON.stringify({
+      tag: 'WEBHOOK_AFTER_DEDUP',
+      eventId: event?.id || null,
+      eventType: event?.type || null,
+      dedupDecision: recorded.inserted ? 'new' : 'duplicate',
+    })
+  );
   if (!recorded.inserted) {
     await updateStripeEventStatus({
       eventId: recorded.eventId,
@@ -2710,6 +2718,15 @@ app.post('/webhook/stripe', async (req, res) => {
     ) {
       let session = event.data.object;
       session = await ensureStripeSessionWithLineItems(session.id, session);
+      const enqueueContext = {
+        eventId: event?.id || null,
+        eventType: event?.type || null,
+        sessionId: session?.id || null,
+        amountTotal: session?.amount_total ?? null,
+        currency: session?.currency || null,
+        META_CAPI_MODE: process.env.META_CAPI_MODE || null,
+      };
+      console.log(JSON.stringify({ tag: 'META_ENQUEUE_ENTER', ...enqueueContext }));
       const webhookLineItemPriceIds = (session?.line_items?.data || [])
         .map((item) => item?.price?.id || null)
         .filter(Boolean);
@@ -2726,6 +2743,13 @@ app.post('/webhook/stripe', async (req, res) => {
           type: event.type,
           reasons: validation.errors,
         });
+        console.log(
+          JSON.stringify({
+            tag: 'META_ENQUEUE_SKIP',
+            ...enqueueContext,
+            reason: 'session_validation_failed',
+          })
+        );
         if (session.mode === 'subscription') {
           const reason = validation.errors.includes('price_mismatch')
             ? 'no_allowed_price'
@@ -2763,6 +2787,7 @@ app.post('/webhook/stripe', async (req, res) => {
         event.type === 'checkout.session.async_payment_succeeded';
 
       if (paid) {
+        console.log(JSON.stringify({ tag: 'META_ENQUEUE_WILL_INSERT', ...enqueueContext }));
         const { subscriptionPriceId, billingPeriod } = getSubscriptionInfoFromSession(session);
         await upsertPaymentRecord({
           sessionId: session.id,
@@ -2782,6 +2807,21 @@ app.post('/webhook/stripe', async (req, res) => {
           paymentIntent: session.payment_intent || null,
           customerEmail: session.customer_details?.email || session.customer_email || null,
         });
+        console.log(
+          JSON.stringify({
+            tag: 'META_ENQUEUE_SKIP',
+            ...enqueueContext,
+            reason: 'enqueue_not_configured',
+          })
+        );
+      } else {
+        console.log(
+          JSON.stringify({
+            tag: 'META_ENQUEUE_SKIP',
+            ...enqueueContext,
+            reason: 'not_paid',
+          })
+        );
       }
 
       logger.info('stripe', 'Checkout session processed', {
