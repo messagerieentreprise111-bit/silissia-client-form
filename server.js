@@ -530,6 +530,16 @@ async function dbQuery(text, params) {
   return dbPool.query(text, params);
 }
 
+function normalizeEmail(value) {
+  const email = (value || '').trim().toLowerCase();
+  if (!email) return null;
+  return email;
+}
+
+function hashSha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
 async function getTableExists(tableName) {
   const result = await dbQuery('SELECT to_regclass($1) AS reg', [`public.${tableName}`]);
   return Boolean(result.rows[0]?.reg);
@@ -2828,6 +2838,12 @@ app.post('/webhook/stripe', async (req, res) => {
           },
           checkout_session_id: session.id,
         };
+        const metaEmail = normalizeEmail(
+          session?.customer_details?.email || session?.customer_email || null
+        );
+        if (metaEmail) {
+          payload.event.user_data = { em: [hashSha256(metaEmail)] };
+        }
         const inserted = await addOutboxEntry({
           submissionId,
           payload,
