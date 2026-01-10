@@ -322,6 +322,12 @@ async function postMetaCapiEvent(eventPayload, mode) {
       );
       error.status = response.status;
       error.bodyText = bodyText;
+      try {
+        const parsed = JSON.parse(bodyText || '{}');
+        error.fbtrace_id = parsed?.error?.fbtrace_id || null;
+      } catch {
+        error.fbtrace_id = null;
+      }
       throw error;
     }
     return { status: response.status, bodyText };
@@ -484,6 +490,12 @@ function logAppsScriptEvent(level, message, meta) {
     meta,
   };
   console.log(JSON.stringify(payload));
+}
+
+function truncateText(value, maxLen = 1000) {
+  const text = typeof value === 'string' ? value : '';
+  if (!text) return '';
+  return text.length > maxLen ? `${text.slice(0, maxLen)}...(truncated)` : text;
 }
 
 async function markOutboxResult(pool, entry, outcome) {
@@ -746,6 +758,8 @@ async function main() {
         const sessionId = basePayload.checkout_session_id || basePayload.event?.event_id || null;
         const eventId = basePayload.event?.event_id || null;
         const status = entry.sheet_status || 'processing';
+        const attemptCount = (entry.attempt_count || 0) + 1;
+        const metaMode = normalizeMetaMode(META_CAPI_MODE);
 
         console.log(
           JSON.stringify({
@@ -754,16 +768,23 @@ async function main() {
             sessionId,
             eventId,
             status,
+            metaMode,
+            pixelIdPresent: Boolean(META_PIXEL_ID),
+            tokenPresent: Boolean(META_CAPI_TOKEN),
+            hasTestEventCode: Boolean(META_TEST_EVENT_CODE),
+            attemptCount,
           })
         );
 
         if (metaMode === 'off') {
-          await markMetaResult(pool, entry, {
+          const outcome = {
             success: false,
             status: null,
             errorMessage: 'Meta CAPI disabled',
             deferMinutes: 60,
-          });
+          };
+          await markMetaResult(pool, entry, outcome);
+          const nextRetryAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
           console.log(
             JSON.stringify({
               tag: 'META_SEND_FAIL',
@@ -771,18 +792,28 @@ async function main() {
               sessionId,
               eventId,
               status: 'off',
+              metaMode,
+              httpStatus: null,
+              responseBody: '',
+              fbtrace_id: null,
+              errorMessage: outcome.errorMessage,
+              nextRetryAt,
+              willRetry: true,
+              finalStatus: 'meta_pending',
             })
           );
           continue;
         }
 
         if (metaMode === 'dry_run' && !META_TEST_EVENT_CODE) {
-          await markMetaResult(pool, entry, {
+          const outcome = {
             success: false,
             status: null,
             errorMessage: 'META_TEST_EVENT_CODE missing',
             deferMinutes: 60,
-          });
+          };
+          await markMetaResult(pool, entry, outcome);
+          const nextRetryAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
           console.log(
             JSON.stringify({
               tag: 'META_SEND_FAIL',
@@ -790,18 +821,28 @@ async function main() {
               sessionId,
               eventId,
               status: 'test_event_code_missing',
+              metaMode,
+              httpStatus: null,
+              responseBody: '',
+              fbtrace_id: null,
+              errorMessage: outcome.errorMessage,
+              nextRetryAt,
+              willRetry: true,
+              finalStatus: 'meta_pending',
             })
           );
           continue;
         }
 
         if (metaMode === 'live' && (!META_PIXEL_ID || !META_CAPI_TOKEN)) {
-          await markMetaResult(pool, entry, {
+          const outcome = {
             success: false,
             status: null,
             errorMessage: 'META_PIXEL_ID or META_CAPI_TOKEN missing',
             deferMinutes: 60,
-          });
+          };
+          await markMetaResult(pool, entry, outcome);
+          const nextRetryAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
           console.log(
             JSON.stringify({
               tag: 'META_SEND_FAIL',
@@ -809,17 +850,26 @@ async function main() {
               sessionId,
               eventId,
               status: 'config_missing',
+              metaMode,
+              httpStatus: null,
+              responseBody: '',
+              fbtrace_id: null,
+              errorMessage: outcome.errorMessage,
+              nextRetryAt,
+              willRetry: true,
+              finalStatus: 'meta_pending',
             })
           );
           continue;
         }
 
         if (!basePayload.event) {
-          await markMetaResult(pool, entry, {
+          const outcome = {
             success: false,
             status: null,
             errorMessage: 'Meta payload missing',
-          });
+          };
+          await markMetaResult(pool, entry, outcome);
           console.log(
             JSON.stringify({
               tag: 'META_SEND_FAIL',
@@ -827,6 +877,14 @@ async function main() {
               sessionId,
               eventId,
               status: 'payload_missing',
+              metaMode,
+              httpStatus: null,
+              responseBody: '',
+              fbtrace_id: null,
+              errorMessage: outcome.errorMessage,
+              nextRetryAt: null,
+              willRetry: false,
+              finalStatus: 'dead',
             })
           );
           continue;
@@ -841,7 +899,10 @@ async function main() {
               submissionId,
               sessionId,
               eventId,
-              status: result.status,
+              metaMode,
+              httpStatus: result.status,
+              responseBody: truncateText(result.bodyText || '(empty)'),
+              matchedTestCode: metaMode === 'dry_run' ? true : null,
             })
           );
         } catch (error) {
@@ -850,19 +911,31 @@ async function main() {
             httpStatus === 429 || httpStatus === null || (httpStatus >= 500 && httpStatus < 600);
           const forceDead =
             !isRetryable && (httpStatus === 400 || httpStatus === 401 || httpStatus === 403);
-          await markMetaResult(pool, entry, {
+          const outcome = {
             success: false,
             status: httpStatus,
             errorMessage: error.message || String(error),
             forceDead,
-          });
+          };
+          await markMetaResult(pool, entry, outcome);
+          const nextRetryAt = isRetryable
+            ? new Date(Date.now() + getNextRetryDelayMs(attemptCount)).toISOString()
+            : null;
+          const finalStatus = isRetryable ? 'meta_pending' : 'dead';
           console.log(
             JSON.stringify({
               tag: 'META_SEND_FAIL',
               submissionId,
               sessionId,
               eventId,
-              status: httpStatus,
+              metaMode,
+              httpStatus,
+              responseBody: truncateText(error.bodyText || ''),
+              fbtrace_id: error.fbtrace_id || null,
+              errorMessage: outcome.errorMessage,
+              nextRetryAt,
+              willRetry: isRetryable,
+              finalStatus,
             })
           );
         }
