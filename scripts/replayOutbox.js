@@ -954,7 +954,10 @@ async function main() {
       duration_ms: durationMs,
     });
 
-    const shouldAlert = afterMetrics.deadCount > 0;
+    const shouldAlert =
+      afterMetrics.pendingCount > 5 ||
+      afterMetrics.oldestPendingAgeSec > 600 ||
+      afterMetrics.deadCount > 0;
 
     if (shouldAlert && (await shouldSendAlert(pool))) {
       await sendAlertEmail({
